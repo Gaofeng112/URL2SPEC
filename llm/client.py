@@ -62,7 +62,10 @@ class LLMClient:
             messages=[
                 {
                     "role": "system",
-                    "content": "你是一个专业的接口文档生成助手，只输出合法 JSON。",
+                    "content": (
+                        "你是一个专业的接口文档生成与接口测试规则抽取助手。"
+                        "你只能输出合法 JSON（不要 Markdown/解释文本）。"
+                    ),
                 },
                 {"role": "user", "content": prompt},
             ],

@@ -2,13 +2,14 @@
 
 import base64
 import hashlib
+import json
 import threading
 from datetime import datetime
 from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
-from utils.sanitizer import safe_preview_body, sanitize_headers
+from capture.sanitizer import safe_preview_body, sanitize_headers
 
 # 按 URL 路径后缀识别的静态资源扩展名，用于过滤非业务接口。
 STATIC_EXTENSIONS = (
@@ -46,16 +47,23 @@ def _short20(value):
     return text[:20]
 
 
-def _looks_like_base64(s):
+def _looks_like_base64(s, min_len=8):
     if not isinstance(s, str):
         return False
     raw = s.strip()
-    if len(raw) < 24:
+    if len(raw) < min_len:
         return False
-    if len(raw) % 4 != 0:
-        return False
-    allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\r\n"
+    allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\r\n-_"
     return all(c in allowed for c in raw)
+
+
+def _normalize_base64(s):
+    raw = s.strip().replace("\n", "").replace("\r", "")
+    raw = raw.replace("-", "+").replace("_", "/")
+    pad = (-len(raw)) % 4
+    if pad:
+        raw += "=" * pad
+    return raw
 
 
 def _iter_strings(obj, path="$", depth=0, max_depth=6, max_items=2000):
@@ -77,21 +85,38 @@ def _iter_strings(obj, path="$", depth=0, max_depth=6, max_items=2000):
         return
 
 
-def _try_vip_decrypt_string(value, key=VIP_DEFAULT_KEY):
+def _try_vip_decrypt_string(value, key=VIP_DEFAULT_KEY, force=False):
     """对疑似 base64 字符串尝试 VIP 解密；成功返回明文，否则返回 None。"""
-    if not _looks_like_base64(value):
+    min_len = 4 if force else 8
+    if not _looks_like_base64(value, min_len=min_len):
         return None
     try:
-        plaintext = vip_decrypt(value, key=key)
+        plaintext = vip_decrypt(_normalize_base64(value), key=key)
     except Exception:
         return None
-    # 粗略判定：解密后应当是可打印文本且长度合理
-    if not isinstance(plaintext, str) or len(plaintext) < 2:
-        return None
-    printable = sum(1 for ch in plaintext[:200] if ch.isprintable() or ch in "\r\n\t")
-    if printable < max(10, int(min(200, len(plaintext)) * 0.6)):
+    if not isinstance(plaintext, str) or not plaintext:
         return None
     return plaintext
+
+
+def _scan_vip_decrypt(body):
+    """扫描 JSON 响应，优先解密 data 等常见密文字段。"""
+    logs = []
+    if isinstance(body, dict):
+        priority_keys = ("data", "content", "result", "payload", "encrypt")
+        for key in priority_keys:
+            val = body.get(key)
+            if isinstance(val, str):
+                plaintext = _try_vip_decrypt_string(val, force=True)
+                if plaintext:
+                    logs.append((f"$.{key}", val, plaintext))
+        for json_path, s in _iter_strings(body):
+            if any(json_path.endswith(f".{k}") for k in priority_keys):
+                continue
+            plaintext = _try_vip_decrypt_string(s)
+            if plaintext:
+                logs.append((json_path, s, plaintext))
+    return logs
 
 
 def safe_get_post_data(request):
@@ -173,8 +198,7 @@ def capture_api_requests(page_url, wait_seconds=8, interactive=True):
     Enter 结束。若 ``interactive=False``，则在页面加载后固定等待
     ``wait_seconds`` 秒。
 
-    页面内注入解密 hook（atob、JSON.parse、CryptoJS、命名含 decrypt 的函数等），
-    捕获到解密时会打印解密前/后各 20 个字符预览。
+    对 JSON 响应中的常见密文字段尝试 VIP 解密，成功时打印解密前/后各 20 个字符。
 
     Args:
         page_url: 待分析的页面 URL。
@@ -241,17 +265,28 @@ def capture_api_requests(page_url, wait_seconds=8, interactive=True):
                 }
 
                 try:
+                    body = None
                     if "application/json" in content_type:
                         body = response.json()
-                        record["response_body_preview"] = safe_preview_body(body)
-                        # Python 侧 VIP 解密：扫描 JSON 中疑似加密字段
+                    elif "text" in content_type or "html" in content_type:
+                        text = response.text()
+                        record["response_body_preview"] = text[:1000]
+                        if text.strip().startswith("{"):
+                            try:
+                                body = json.loads(text)
+                                record["response_body_preview"] = safe_preview_body(body)
+                            except Exception:
+                                body = None
+                    else:
+                        record["response_body_preview"] = "[非文本响应，已忽略]"
+
+                    if body is not None:
+                        if "response_body_preview" not in record or record["response_body_preview"] is None:
+                            record["response_body_preview"] = safe_preview_body(body)
                         try:
                             decrypt_logs = []
-                            for json_path, s in _iter_strings(body):
-                                plaintext = _try_vip_decrypt_string(s)
-                                if plaintext is None:
-                                    continue
-                                before20 = _short20(s)
+                            for json_path, cipher, plaintext in _scan_vip_decrypt(body):
+                                before20 = _short20(cipher)
                                 after20 = _short20(plaintext)
                                 print(f"[解密] 来源: vip_decrypt {json_path}")
                                 print(f"  解密前(20字): {before20}")
@@ -269,26 +304,7 @@ def capture_api_requests(page_url, wait_seconds=8, interactive=True):
                             record["decrypt_preview"] = [
                                 {"source": "vip_decrypt", "error": str(e)[:200]}
                             ]
-                    elif "text" in content_type or "html" in content_type:
-                        text = response.text()
-                        record["response_body_preview"] = text[:1000]
-                        # text 响应：若整体就是加密串，尝试 VIP 解密
-                        plaintext = _try_vip_decrypt_string(text)
-                        if plaintext is not None:
-                            before20 = _short20(text)
-                            after20 = _short20(plaintext)
-                            print("[解密] 来源: vip_decrypt body(text)")
-                            print(f"  解密前(20字): {before20}")
-                            print(f"  解密后(20字): {after20}")
-                            record["decrypt_preview"] = [
-                                {
-                                    "source": "vip_decrypt body(text)",
-                                    "before20": before20,
-                                    "after20": after20,
-                                    "after_preview": plaintext[:500],
-                                }
-                            ]
-                    else:
+                    elif record.get("response_body_preview") is None:
                         record["response_body_preview"] = "[非文本响应，已忽略]"
                 except Exception as e:
                     record["response_body_preview"] = f"[响应体读取失败：{str(e)}]"
@@ -325,7 +341,10 @@ def capture_api_requests(page_url, wait_seconds=8, interactive=True):
             print(f"页面访问异常：{e}")
         finally:
             capturing = False
-            page.wait_for_timeout(500)
+            try:
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
             browser.close()
 
     print(f"采集结束，共捕获 {len(api_records)} 条 XHR/Fetch 接口")

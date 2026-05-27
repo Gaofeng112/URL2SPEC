@@ -7,3 +7,4 @@ output/
 *.log
 playwright-report/
 test-results/
+pytest-cache-files*/

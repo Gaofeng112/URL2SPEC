@@ -2,8 +2,8 @@
 
 import json
 
-from processor.parsers import parse_url_info
-from processor.schema_infer import infer_schema
+from capture.parsers import parse_url_info
+from capture.schema_infer import infer_schema
 
 # 非 JSON 请求/响应体在送入 LLM 前的最大字符数。
 _BODY_TEXT_LIMIT = 500

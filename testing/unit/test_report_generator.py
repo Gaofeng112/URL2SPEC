@@ -1,6 +1,6 @@
 """报告生成模块单元测试。"""
 
-from generator.report_generator import generate_markdown_report, parse_junit_xml
+from report.test_report import generate_markdown_report, parse_junit_xml
 
 
 def test_parse_junit_xml(tmp_path):

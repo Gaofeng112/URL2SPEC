@@ -16,7 +16,7 @@ def build_api_analysis_prompt(api_info):
 你是一名资深接口测试工程师和接口文档专家。
 
 我会给你一个从浏览器页面中捕获到的接口结构信息。
-请你根据 URL、请求方法、请求参数、请求体结构、响应体结构，推测该接口的功能，并生成结构化接口文档信息。
+请你根据 URL、请求方法、请求参数、请求体结构、响应体结构，推测该接口的功能，并生成可用于自动化测试的结构化接口文档信息（务必可机器执行）。
 
 要求：
 1. 不要编造接口中不存在的参数。
@@ -26,6 +26,8 @@ def build_api_analysis_prompt(api_info):
 5. 字段说明要简洁、准确。
 6. 如果接口功能不明显，请根据路径和字段进行合理推断。
 7. confidence 表示你对接口功能推断的置信度，可选 high、medium、low。
+8. 你必须输出 success_criteria 与 parameter_rules，让测试脚本可以据此生成断言与负例。
+9. 任何 JSONPath/字段路径使用“点号路径”，例如：data.list[0].id（不要使用 $ 符号）。
 
 请严格按照以下 JSON 格式输出：
 
@@ -34,6 +36,33 @@ def build_api_analysis_prompt(api_info):
   "description": "",
   "method": "",
   "path": "",
+  "success_criteria": {{
+    "http_status": {{
+      "ok": [200],
+      "retryable": [429, 503]
+    }},
+    "json": {{
+      "must_exist_paths": [],
+      "success_path": "",
+      "success_values": [],
+      "code_path": "",
+      "ok_codes": [],
+      "message_path": ""
+    }}
+  }},
+  "parameter_rules": [
+    {{
+      "name": "",
+      "in": "query/body/header/path",
+      "type": "string/number/boolean/object/array/unknown",
+      "required": "true/false/unknown",
+      "enum": [],
+      "min_length": null,
+      "max_length": null,
+      "pattern": "",
+      "description": ""
+    }}
+  ],
   "request_params": [
     {{
       "name": "",
@@ -50,6 +79,11 @@ def build_api_analysis_prompt(api_info):
       "description": ""
     }}
   ],
+  "response_rules": {{
+    "content_type_contains": "",
+    "json_schema_hint": null,
+    "must_exist_paths": []
+  }},
   "possible_test_cases": [
     {{
       "case_name": "",
