@@ -2,17 +2,96 @@
 
 import base64
 import hashlib
+import threading
 from datetime import datetime
 from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
 from utils.sanitizer import safe_preview_body, sanitize_headers
+
 # 按 URL 路径后缀识别的静态资源扩展名，用于过滤非业务接口。
 STATIC_EXTENSIONS = (
     ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
     ".woff", ".woff2", ".ttf", ".map", ".webp", ".mp4", ".mp3",
 )
+
+# VIP 解密默认 key（可按需调整/外部传入）。
+VIP_DEFAULT_KEY = "VIP4.2.0"
+
+
+def vip_decrypt(data, key=VIP_DEFAULT_KEY):
+    """vip解密（按用户提供的 Python 版本实现）。"""
+    content = base64.b64decode(data)
+    key = hashlib.md5(hashlib.md5(key.encode("utf-8")).hexdigest().encode("utf-8")).hexdigest()
+    x = 0
+    length = len(content)
+    result = b""
+    for i in range(length):
+        if x == 32:
+            x = 0
+        char = key[x]
+        result += bytes([content[i] ^ ord(char)])
+        x += 1
+    return result.decode("utf-8")
+
+
+def _short20(value):
+    if value is None:
+        return ""
+    try:
+        text = value if isinstance(value, str) else str(value)
+    except Exception:
+        text = repr(value)
+    return text[:20]
+
+
+def _looks_like_base64(s):
+    if not isinstance(s, str):
+        return False
+    raw = s.strip()
+    if len(raw) < 24:
+        return False
+    if len(raw) % 4 != 0:
+        return False
+    allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\r\n"
+    return all(c in allowed for c in raw)
+
+
+def _iter_strings(obj, path="$", depth=0, max_depth=6, max_items=2000):
+    """遍历 JSON-like 对象里的字符串值，产出 (path, value)。"""
+    if max_items <= 0:
+        return
+    if depth > max_depth:
+        return
+    if isinstance(obj, str):
+        yield (path, obj)
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _iter_strings(v, f"{path}.{k}", depth + 1, max_depth, max_items - 1)
+        return
+    if isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from _iter_strings(v, f"{path}[{i}]", depth + 1, max_depth, max_items - 1)
+        return
+
+
+def _try_vip_decrypt_string(value, key=VIP_DEFAULT_KEY):
+    """对疑似 base64 字符串尝试 VIP 解密；成功返回明文，否则返回 None。"""
+    if not _looks_like_base64(value):
+        return None
+    try:
+        plaintext = vip_decrypt(value, key=key)
+    except Exception:
+        return None
+    # 粗略判定：解密后应当是可打印文本且长度合理
+    if not isinstance(plaintext, str) or len(plaintext) < 2:
+        return None
+    printable = sum(1 for ch in plaintext[:200] if ch.isprintable() or ch in "\r\n\t")
+    if printable < max(10, int(min(200, len(plaintext)) * 0.6)):
+        return None
+    return plaintext
 
 
 def safe_get_post_data(request):
@@ -81,15 +160,26 @@ def is_static_resource(url):
     return any(path.endswith(ext) for ext in STATIC_EXTENSIONS)
 
 
-def capture_api_requests(page_url, wait_seconds=8):
-    """打开目标页面并采集所有 XHR/Fetch 请求记录。
+def _wait_for_interactive_stop(page, stop_event, poll_ms=300):
+    """在交互模式下轮询等待用户结束信号，同时保持 Playwright 事件循环活跃。"""
+    while not stop_event.is_set():
+        page.wait_for_timeout(poll_ms)
 
-    使用 Chromium 有头模式访问页面，在 ``domcontentloaded`` 后再等待
-    ``wait_seconds`` 秒，以便 SPA 触发异步接口。
+
+def capture_api_requests(page_url, wait_seconds=8, interactive=True):
+    """打开目标页面并采集 XHR/Fetch 请求记录。
+
+    默认以有头浏览器交互式采集：用户可在页面中操作触发接口，回到终端按
+    Enter 结束。若 ``interactive=False``，则在页面加载后固定等待
+    ``wait_seconds`` 秒。
+
+    页面内注入解密 hook（atob、JSON.parse、CryptoJS、命名含 decrypt 的函数等），
+    捕获到解密时会打印解密前/后各 20 个字符预览。
 
     Args:
         page_url: 待分析的页面 URL。
-        wait_seconds: 页面加载完成后额外等待的秒数，用于捕获延迟发起的请求。
+        wait_seconds: 非交互模式下页面加载完成后的额外等待秒数。
+        interactive: 是否启用交互式采集（终端按 Enter 结束）。
 
     Returns:
         接口记录列表。每条记录包含 method、url、headers、body 预览等字段。
@@ -97,9 +187,10 @@ def capture_api_requests(page_url, wait_seconds=8):
     api_records = []
     seen = set()
     capturing = True
+    stop_event = threading.Event()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=100)
+        browser = p.chromium.launch(headless=False, slow_mo=50)
 
         context = browser.new_context(
             viewport={"width": 1366, "height": 768},
@@ -146,15 +237,57 @@ def capture_api_requests(page_url, wait_seconds=8):
                     "response_headers": sanitize_headers(response_headers),
                     "content_type": content_type,
                     "response_body_preview": None,
+                    "decrypt_preview": [],
                 }
 
                 try:
                     if "application/json" in content_type:
                         body = response.json()
                         record["response_body_preview"] = safe_preview_body(body)
+                        # Python 侧 VIP 解密：扫描 JSON 中疑似加密字段
+                        try:
+                            decrypt_logs = []
+                            for json_path, s in _iter_strings(body):
+                                plaintext = _try_vip_decrypt_string(s)
+                                if plaintext is None:
+                                    continue
+                                before20 = _short20(s)
+                                after20 = _short20(plaintext)
+                                print(f"[解密] 来源: vip_decrypt {json_path}")
+                                print(f"  解密前(20字): {before20}")
+                                print(f"  解密后(20字): {after20}")
+                                decrypt_logs.append(
+                                    {
+                                        "source": f"vip_decrypt {json_path}",
+                                        "before20": before20,
+                                        "after20": after20,
+                                        "after_preview": plaintext[:500],
+                                    }
+                                )
+                            record["decrypt_preview"] = decrypt_logs
+                        except Exception as e:
+                            record["decrypt_preview"] = [
+                                {"source": "vip_decrypt", "error": str(e)[:200]}
+                            ]
                     elif "text" in content_type or "html" in content_type:
                         text = response.text()
                         record["response_body_preview"] = text[:1000]
+                        # text 响应：若整体就是加密串，尝试 VIP 解密
+                        plaintext = _try_vip_decrypt_string(text)
+                        if plaintext is not None:
+                            before20 = _short20(text)
+                            after20 = _short20(plaintext)
+                            print("[解密] 来源: vip_decrypt body(text)")
+                            print(f"  解密前(20字): {before20}")
+                            print(f"  解密后(20字): {after20}")
+                            record["decrypt_preview"] = [
+                                {
+                                    "source": "vip_decrypt body(text)",
+                                    "before20": before20,
+                                    "after20": after20,
+                                    "after_preview": plaintext[:500],
+                                }
+                            ]
                     else:
                         record["response_body_preview"] = "[非文本响应，已忽略]"
                 except Exception as e:
@@ -167,9 +300,27 @@ def capture_api_requests(page_url, wait_seconds=8):
 
         page.on("response", handle_response)
 
+        if interactive:
+            threading.Thread(
+                target=lambda: (
+                    input("按 Enter 键结束采集..."),
+                    stop_event.set(),
+                ),
+                daemon=True,
+            ).start()
+            print("=" * 60)
+            print("交互式接口采集已启动")
+            print("请在浏览器中操作页面以触发 XHR/Fetch 请求")
+            print("若页面存在解密逻辑，将打印解密前/后各 20 个字符")
+            print("完成后返回此终端，按 Enter 键结束采集")
+            print("=" * 60)
+
         try:
             page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(wait_seconds * 1000)
+            if interactive:
+                _wait_for_interactive_stop(page, stop_event)
+            else:
+                page.wait_for_timeout(wait_seconds * 1000)
         except Exception as e:
             print(f"页面访问异常：{e}")
         finally:
@@ -177,4 +328,5 @@ def capture_api_requests(page_url, wait_seconds=8):
             page.wait_for_timeout(500)
             browser.close()
 
+    print(f"采集结束，共捕获 {len(api_records)} 条 XHR/Fetch 接口")
     return api_records
