@@ -1,26 +1,6 @@
-# URL2SPEC — 智能接口测试智能体
+# URL2SPEC
 
-给定页面 URL，自动完成：接口抓包 → 清洗 → LLM 分析 → 接口文档 → pytest 脚本 → 测试报告。
-
-## 项目结构（4 个核心模块）
-
-```
-URL2SPEC/
-├── main.py              # 主入口
-├── capture/             # 采集：Playwright 抓包、清洗、脱敏、VIP 解密
-├── llm/                 # LLM 推理：提示词 + 客户端
-├── report/              # 报告渲染代码：接口文档、测试报告、知识库合并
-├── testing/             # 测试：脚本生成、pytest 执行、单元测试
-│   ├── script_generator.py
-│   ├── runner.py
-│   └── unit/            # 项目 pytest 单元测试
-├── config/              # 本地配置目录：登录态、cookie、私有运行配置（git 忽略敏感文件）
-├── docs/                # 文档：需求说明、知识库模板、生成的接口/测试文档
-└── output/              # 中间运行产物（git 忽略）
-    ├── data/
-    ├── reports/         # JUnit XML 等机器报告
-    └── generated_tests/
-```
+给定一个页面 URL，自动完成接口采集、LLM 分析、接口文档生成、pytest 回放测试和测试报告输出。
 
 ## 快速开始
 
@@ -32,106 +12,90 @@ cp .env.example .env
 python main.py "https://vip.yaozh.com"
 ```
 
-### 首次登录并保存 Cookie
+首次运行时，如果本地没有登录态，程序会打开浏览器让你登录；登录后按 Enter 或关闭页面，登录态会自动保存到 `config/<域名>.storage_state.json`。后续运行会默认复用该文件，不需要再传 `--cookie-file`。
 
-默认不需要额外传 `--cookie-file`。程序会按目标域名自动使用本地登录态文件，例如 `https://vip.yaozh.com` 会使用 `config/vip.yaozh.com.storage_state.json`。
+## 常用命令
 
 ```bash
+# 采集页面接口，并基于知识库增量分析
 python main.py "https://vip.yaozh.com"
-```
 
-如果本地还没有登录态文件，程序会先打开浏览器登录页。手动登录完成后回到终端按 Enter，登录态会自动保存；下次再运行同一个目标站点时，会直接加载本地登录态绕过登录。
-
-如果登录页和目标页不同，可以额外指定登录页，仍然不需要传 cookie 文件：
-
-```bash
-python main.py "https://vip.yaozh.com/member" --login-url "https://vip.yaozh.com/login"
-```
-
-若 cookie 过期，可强制重新登录并覆盖默认登录态文件：
-
-```bash
+# cookie 过期时重新登录并覆盖本地登录态
 python main.py "https://vip.yaozh.com" --refresh-cookie
-```
 
-生成 pytest 接口回放测试时，也会自动复用同一个登录态文件，避免测试请求因缺少登录态变成无效 401/未登录响应。
+# 登录页和目标页不一致时
+python main.py "https://vip.yaozh.com/member" --login-url "https://vip.yaozh.com/login"
 
-如需和旧流程兼容，仍可手动指定固定路径，或在 `.env` 中配置：
-
-```env
-CAPTURE_COOKIE_FILE=config/vip.yaozh.com.storage_state.json
-CAPTURE_LOGIN_URL=https://vip.yaozh.com/login
-```
-
-加载已有文件时支持的格式：
-
-- Playwright `storage_state.json`：`{"cookies": [...], "origins": [...]}`
-- 浏览器导出的 cookie JSON 数组：`[{"name": "...", "value": "...", "domain": "...", "path": "/"}]`
-- 简单 JSON 键值：`{"sid": "xxx", "token": "yyy"}`
-- Cookie 请求头字符串：`sid=xxx; token=yyy`
-- Netscape `cookies.txt`
-
-### 按 URL 过滤采集接口
-
-默认采集页面触发的全部 XHR/Fetch 接口。若只希望采集指定路径下的接口，可以使用通配符过滤：
-
-```bash
+# 只采集指定路径下的接口
 python main.py "https://vip.yaozh.com" --url-filter "api/zgqxss/*"
+
+# 忽略旧知识库，本次接口全部重新分析并覆盖知识库
+python main.py "https://vip.yaozh.com" --rebuild-kb
 ```
 
-规则会匹配接口 path，因此 `api/zgqxss/*` 可以匹配 `/api/zgqxss/list`、`/api/zgqxss/detail?id=1` 这类接口。多个规则可以重复传入：
-
-```bash
-python main.py "https://vip.yaozh.com" \
-  --url-filter "api/zgqxss/*" \
-  --url-filter "api/user/*"
-```
-
-也可以在 `.env` 中配置，多个规则用英文逗号分隔：
+多个过滤规则可以重复传入，也可以写到 `.env`：
 
 ```env
 CAPTURE_URL_FILTERS=api/zgqxss/*,api/user/*
+COMMON_API_FILTERS=api/common/*,api/dict/*
 ```
 
-采集阶段会按接口结构自动去重：同一路径下 query 参数值不同、JSON body 字段值不同、form body 字段值不同的请求，只保留一条接口记录；如果参数名或 body 字段结构不同，则视为不同接口。
+## 输出位置
 
-### 固定接口知识库
+| 内容 | 路径 | 说明 |
+|------|------|------|
+| 本地登录态 | `config/*.storage_state.json` | 私有文件，Git 忽略 |
+| 接口知识库 | `docs/api_knowledge_base.json` | 长期维护，默认 Git 忽略 |
+| 接口文档 | `docs/api_doc.md` | 由当前知识库生成 |
+| 测试报告 | `docs/test_report.md` | 由本次 pytest 结果生成 |
+| 原始/清洗数据 | `output/data/` | 临时运行产物 |
+| 生成的 pytest | `output/generated_tests/` | 临时运行产物 |
+| JUnit XML | `output/reports/` | 临时运行产物 |
 
-每次采集和 LLM 分析完成后，会增量更新固定知识库，默认路径：
+## 项目结构
 
 ```text
-docs/api_knowledge_base.json
+URL2SPEC/
+├── main.py              # 主入口
+├── capture/             # Playwright 采集、过滤、去重、脱敏
+├── llm/                 # LLM 客户端和提示词
+├── report/              # 接口文档、测试报告、知识库合并
+├── testing/             # pytest 脚本生成、执行器、单元测试
+├── config/              # 本地私有配置和登录态
+├── docs/                # 知识库模板、生成文档
+└── output/              # 运行中间产物
 ```
 
-真实知识库可能包含抓包样本、接口返回片段或用户数据，默认不提交到 Git；仓库中提供 `docs/api_knowledge_base.example.json` 作为结构模板。
+## 知识库维护
 
-生成的人工阅读文档默认输出到：
+知识库默认是增量模式：已经存在的接口不会重复调用 LLM，只有新增接口会分析。接口按 `请求方法 + 域名 + 路径` 合并。
 
-- `docs/api_doc.md`
-- `docs/test_report.md`
+常用维护字段：
 
-这两个文件由当前采集数据生成，默认不提交到 Git；如需沉淀正式版本，可人工脱敏后另存。
+| 字段 | 用途 |
+|------|------|
+| `include_in_tests` | 是否生成 pytest 回放测试 |
+| `test_skip_reason` | 不测试的原因 |
+| `tags` | 标签，如 `common`、`core`、`auth` |
+| `kb_notes` | 人工维护备注 |
+| `locked` | 锁定后后续采集不覆盖该接口 |
+| `manual_overrides` | 手动覆盖分析结果 |
 
-知识库按 `请求方法 + 域名 + 接口路径` 合并接口，适合长期维护和人工修订。常用字段：
+公共/低价值接口会被自动标记为不测试，例如 `api/config/*`、`api/search/config`、`api/ad`、`api/synclogin/*`、`resources/*`。
 
-- `include_in_tests`：是否生成接口测试，公共接口可改为 `false`
-- `test_skip_reason`：跳过测试原因，例如 `公共字典接口，无需回放测试`
-- `tags`：接口标签，例如 `["common", "dict"]`
-- `kb_notes`：知识库维护备注
-- `locked`：设为 `true` 后后续采集不会覆盖该接口条目
-- `manual_overrides`：手动覆盖 `analysis`、`source`、`raw` 中的字段
+默认规则在 `report/knowledge_base.py` 的 `COMMON_API_PATTERNS` 中维护。需要新增公共接口规则时，追加一条：
 
-后续再次采集时，程序会先用知识库判断接口是否已处理过。已存在的接口会跳过 LLM 分析，只有新增接口才会调用 LLM；如果本次没有新增接口，则直接基于现有知识库重新生成文档和测试。
+```python
+COMMON_API_PATTERNS = (
+    ("api/config/*", "公共配置接口，无需加入接口回放测试", ["common", "config"]),
+    ("api/search/config", "搜索配置接口，无需加入接口回放测试", ["common", "config"]),
+    ("api/ad", "广告接口，无需加入接口回放测试", ["common", "ad"]),
+    ("api/synclogin/*", "登录同步接口依赖会话/签名，回放测试不稳定", ["common", "auth"]),
+    ("resources/*", "静态资源接口，无需加入接口回放测试", ["common", "static"]),
+)
+```
 
-新增接口进入知识库时，会自动把一些低价值回放接口标记为公共接口并跳过测试，例如：
-
-- `api/config/*`：页面配置、导航、续费、公告等配置接口
-- `api/search/config`：搜索配置接口
-- `api/ad`：广告接口
-- `api/synclogin/*`：依赖会话、时间戳或签名的登录同步接口
-- `resources/*`：静态资源接口
-
-自动标记只作用于新接口。你在知识库里人工维护过的 `include_in_tests`、`test_skip_reason`、`tags` 会被保留；如果某个接口虽然像公共接口但你想长期纳入测试，可手动改为：
+如果某个接口需要长期纳入测试，手动改成：
 
 ```json
 {
@@ -141,13 +105,7 @@ docs/api_knowledge_base.json
 }
 ```
 
-如果希望完全忽略旧知识库，并用本次抓到的接口重新分析、覆盖知识库，再生成测试，可使用：
-
-```bash
-python main.py "https://vip.yaozh.com" --rebuild-kb
-```
-
-示例：公共接口只进入文档，不生成 pytest：
+如果某个接口只进入文档、不做回放测试：
 
 ```json
 {
@@ -157,22 +115,10 @@ python main.py "https://vip.yaozh.com" --rebuild-kb
 }
 ```
 
-也可以用规则批量标记公共接口：
-
-```bash
-python main.py "https://vip.yaozh.com" --skip-test-filter "api/common/*"
-```
-
-或写到 `.env`：
-
-```env
-API_KNOWLEDGE_BASE_FILE=docs/api_knowledge_base.json
-COMMON_API_FILTERS=api/common/*,api/dict/*
-```
-
 ## 测试说明
 
-| 类型 | 位置 | 命令 |
-|------|------|------|
-| 项目单元测试 | `testing/unit/` | `pytest` |
-| 流水线生成的接口测试 | `output/generated_tests/` | 由 `main.py` 自动执行 |
+```bash
+pytest
+```
+
+主流程会自动生成并执行接口回放测试。每个接口通常生成两个 pytest 用例：一个正例，一个缺参负例；因此 pytest 收集数量可能是接口数量的两倍。
