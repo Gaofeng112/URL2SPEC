@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 venv/
 .env
+cookies*.json
+storage_state*.json
 output/
 *.log
 playwright-report/

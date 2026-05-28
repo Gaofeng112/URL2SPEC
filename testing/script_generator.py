@@ -135,6 +135,9 @@ def build_test_cases(analysis_results, page_url=None):
     cases = []
 
     for index, item in enumerate(analysis_results, start=1):
+        if item.get("include_in_tests") is False:
+            continue
+
         raw = item.get("raw") or {}
         source = item.get("source") or {}
         analysis = item.get("analysis") or {}

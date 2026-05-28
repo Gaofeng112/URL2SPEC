@@ -32,6 +32,105 @@ cp .env.example .env
 python main.py "https://vip.yaozh.com"
 ```
 
+### 首次登录并保存 Cookie
+
+如果还没有 cookie 文件，直接指定一个保存路径。程序会先打开浏览器登录页，手动登录完成后回到终端按 Enter，登录态会保存到该文件；随后自动进入目标页开始采集。
+
+```bash
+python main.py "https://vip.yaozh.com" --cookie-file "./cookies.json"
+```
+
+如果登录页和目标页不同，可以额外指定登录页：
+
+```bash
+python main.py "https://vip.yaozh.com/member" \
+  --cookie-file "./cookies.json" \
+  --login-url "https://vip.yaozh.com/login"
+```
+
+后续再次运行同一个命令时，会优先加载 `./cookies.json`，直接绕过登录。若 cookie 过期，可强制重新登录并覆盖保存：
+
+```bash
+python main.py "https://vip.yaozh.com" --cookie-file "./cookies.json" --refresh-cookie
+```
+
+也可以在 `.env` 中配置默认路径：
+
+```env
+CAPTURE_COOKIE_FILE=./cookies.json
+CAPTURE_LOGIN_URL=https://vip.yaozh.com/login
+```
+
+加载已有文件时支持的格式：
+
+- Playwright `storage_state.json`：`{"cookies": [...], "origins": [...]}`
+- 浏览器导出的 cookie JSON 数组：`[{"name": "...", "value": "...", "domain": "...", "path": "/"}]`
+- 简单 JSON 键值：`{"sid": "xxx", "token": "yyy"}`
+- Cookie 请求头字符串：`sid=xxx; token=yyy`
+- Netscape `cookies.txt`
+
+### 按 URL 过滤采集接口
+
+默认采集页面触发的全部 XHR/Fetch 接口。若只希望采集指定路径下的接口，可以使用通配符过滤：
+
+```bash
+python main.py "https://vip.yaozh.com" --url-filter "api/zgqxss/*"
+```
+
+规则会匹配接口 path，因此 `api/zgqxss/*` 可以匹配 `/api/zgqxss/list`、`/api/zgqxss/detail?id=1` 这类接口。多个规则可以重复传入：
+
+```bash
+python main.py "https://vip.yaozh.com" \
+  --url-filter "api/zgqxss/*" \
+  --url-filter "api/user/*"
+```
+
+也可以在 `.env` 中配置，多个规则用英文逗号分隔：
+
+```env
+CAPTURE_URL_FILTERS=api/zgqxss/*,api/user/*
+```
+
+### 固定接口知识库
+
+每次采集和 LLM 分析完成后，会增量更新固定知识库，默认路径：
+
+```text
+docs/api_knowledge_base.json
+```
+
+知识库按 `请求方法 + 域名 + 接口路径` 合并接口，适合长期维护和人工修订。常用字段：
+
+- `include_in_tests`：是否生成接口测试，公共接口可改为 `false`
+- `test_skip_reason`：跳过测试原因，例如 `公共字典接口，无需回放测试`
+- `tags`：接口标签，例如 `["common", "dict"]`
+- `kb_notes`：知识库维护备注
+- `locked`：设为 `true` 后后续采集不会覆盖该接口条目
+- `manual_overrides`：手动覆盖 `analysis`、`source`、`raw` 中的字段
+
+示例：公共接口只进入文档，不生成 pytest：
+
+```json
+{
+  "include_in_tests": false,
+  "test_skip_reason": "公共接口，无需加入接口回放测试",
+  "tags": ["common"]
+}
+```
+
+也可以用规则批量标记公共接口：
+
+```bash
+python main.py "https://vip.yaozh.com" --skip-test-filter "api/common/*"
+```
+
+或写到 `.env`：
+
+```env
+API_KNOWLEDGE_BASE_FILE=docs/api_knowledge_base.json
+COMMON_API_FILTERS=api/common/*,api/dict/*
+```
+
 ## 测试说明
 
 | 类型 | 位置 | 命令 |

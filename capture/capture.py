@@ -1,10 +1,12 @@
 """使用 Playwright 打开页面并捕获 XHR/Fetch 网络请求。"""
 
 import base64
+import fnmatch
 import hashlib
 import json
 import threading
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
@@ -185,13 +187,238 @@ def is_static_resource(url):
     return any(path.endswith(ext) for ext in STATIC_EXTENSIONS)
 
 
+def _normalize_url_filters(url_filters):
+    if not url_filters:
+        return []
+    if isinstance(url_filters, str):
+        values = url_filters.split(",")
+    else:
+        values = []
+        for item in url_filters:
+            values.extend(str(item).split(","))
+    return [item.strip() for item in values if item and item.strip()]
+
+
+def _url_matches_filter(url, pattern):
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    normalized_path = path.lstrip("/")
+    normalized_pattern = pattern.lstrip("/")
+
+    if pattern.startswith(("http://", "https://")):
+        return fnmatch.fnmatch(url, pattern)
+
+    return (
+        fnmatch.fnmatch(path, pattern)
+        or fnmatch.fnmatch(path, f"/{normalized_pattern}")
+        or fnmatch.fnmatch(normalized_path, normalized_pattern)
+    )
+
+
+def url_matches_filters(url, url_filters):
+    """判断 URL 是否匹配任一采集过滤规则；无规则时默认通过。"""
+    filters = _normalize_url_filters(url_filters)
+    if not filters:
+        return True
+    return any(_url_matches_filter(url, pattern) for pattern in filters)
+
+
 def _wait_for_interactive_stop(page, stop_event, poll_ms=300):
     """在交互模式下轮询等待用户结束信号，同时保持 Playwright 事件循环活跃。"""
     while not stop_event.is_set():
         page.wait_for_timeout(poll_ms)
 
 
-def capture_api_requests(page_url, wait_seconds=8, interactive=True):
+def _target_cookie_url(page_url):
+    parsed = urlparse(page_url)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"目标 URL 不合法，无法推断 cookie 作用域：{page_url}")
+    return f"{parsed.scheme}://{parsed.netloc}/"
+
+
+def _normalize_same_site(value):
+    if not value:
+        return None
+    normalized = str(value).strip().lower()
+    mapping = {
+        "lax": "Lax",
+        "strict": "Strict",
+        "none": "None",
+        "no_restriction": "None",
+        "no-restriction": "None",
+        "no restriction": "None",
+        "unspecified": None,
+    }
+    return mapping.get(normalized)
+
+
+def _normalize_cookie(cookie, page_url):
+    if not isinstance(cookie, dict):
+        return None
+
+    name = cookie.get("name")
+    value = cookie.get("value")
+    if name is None or value is None:
+        return None
+
+    normalized = {
+        "name": str(name),
+        "value": str(value),
+    }
+
+    if cookie.get("url"):
+        normalized["url"] = str(cookie["url"])
+    elif cookie.get("domain"):
+        normalized["domain"] = str(cookie["domain"])
+        normalized["path"] = str(cookie.get("path") or "/")
+    else:
+        normalized["url"] = _target_cookie_url(page_url)
+
+    if "expirationDate" in cookie and "expires" not in cookie:
+        normalized["expires"] = cookie["expirationDate"]
+    if "http_only" in cookie and "httpOnly" not in cookie:
+        normalized["httpOnly"] = cookie["http_only"]
+
+    for key in ("expires", "httpOnly", "secure"):
+        if key in cookie and cookie[key] is not None:
+            normalized[key] = cookie[key]
+
+    same_site = _normalize_same_site(cookie.get("sameSite") or cookie.get("same_site"))
+    if same_site:
+        normalized["sameSite"] = same_site
+
+    return normalized
+
+
+def _cookies_from_mapping(data, page_url):
+    return [
+        _normalize_cookie({"name": name, "value": value, "url": _target_cookie_url(page_url)}, page_url)
+        for name, value in data.items()
+    ]
+
+
+def _parse_cookie_header(text, page_url):
+    cookies = []
+    for part in text.replace("\n", ";").split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        if not name:
+            continue
+        cookies.append(
+            {
+                "name": name,
+                "value": value.strip(),
+                "url": _target_cookie_url(page_url),
+            }
+        )
+    return cookies
+
+
+def _parse_netscape_cookies(text):
+    cookies = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 7:
+            continue
+        domain, _include_subdomains, path, secure, expires, name, value = parts
+        cookie = {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": path or "/",
+            "secure": secure.upper() == "TRUE",
+        }
+        try:
+            cookie["expires"] = int(expires)
+        except ValueError:
+            pass
+        cookies.append(cookie)
+    return cookies
+
+
+def _cookie_file_ready(cookie_file):
+    if not cookie_file:
+        return False
+    path = Path(cookie_file)
+    return path.exists() and path.stat().st_size > 0
+
+
+def _is_playwright_storage_state_file(cookie_file):
+    if not _cookie_file_ready(cookie_file):
+        return False
+    try:
+        data = json.loads(Path(cookie_file).read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return (
+        isinstance(data, dict)
+        and isinstance(data.get("cookies"), list)
+        and isinstance(data.get("origins"), list)
+    )
+
+
+def _save_storage_state(context, cookie_file):
+    path = Path(cookie_file)
+    if path.parent != Path("."):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    context.storage_state(path=str(path))
+    print(f"已保存登录态：{path}")
+
+
+def load_cookies_from_file(cookie_file, page_url):
+    """读取已有 cookie，并转换为 Playwright ``add_cookies`` 支持的格式。
+
+    支持 Playwright storage_state、浏览器导出的 cookie JSON、简单键值 JSON、
+    ``Cookie`` 请求头字符串，以及 Netscape cookies.txt。
+    """
+    if not cookie_file:
+        return []
+
+    path = Path(cookie_file)
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+
+    raw_cookies = []
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            raw_cookies = data
+        elif isinstance(data, dict) and isinstance(data.get("cookies"), list):
+            raw_cookies = data["cookies"]
+        elif isinstance(data, dict):
+            header = data.get("cookie") or data.get("Cookie")
+            if isinstance(header, str):
+                raw_cookies = _parse_cookie_header(header, page_url)
+            else:
+                raw_cookies = _cookies_from_mapping(data, page_url)
+    except json.JSONDecodeError:
+        raw_cookies = _parse_netscape_cookies(text)
+        if not raw_cookies:
+            raw_cookies = _parse_cookie_header(text, page_url)
+
+    cookies = []
+    for cookie in raw_cookies:
+        normalized = _normalize_cookie(cookie, page_url)
+        if normalized:
+            cookies.append(normalized)
+    return cookies
+
+
+def capture_api_requests(
+    page_url,
+    wait_seconds=8,
+    interactive=True,
+    cookie_file=None,
+    login_url=None,
+    refresh_cookie=False,
+    url_filters=None,
+):
     """打开目标页面并采集 XHR/Fetch 请求记录。
 
     默认以有头浏览器交互式采集：用户可在页面中操作触发接口，回到终端按
@@ -204,6 +431,10 @@ def capture_api_requests(page_url, wait_seconds=8, interactive=True):
         page_url: 待分析的页面 URL。
         wait_seconds: 非交互模式下页面加载完成后的额外等待秒数。
         interactive: 是否启用交互式采集（终端按 Enter 结束）。
+        cookie_file: 可选的已有 cookie 文件路径，用于绕过登录后直接采集目标页。
+        login_url: 首次登录或刷新登录态时打开的登录页；默认使用 page_url。
+        refresh_cookie: 是否忽略现有 cookie 文件，重新登录并覆盖保存。
+        url_filters: 可选 URL 通配符列表；设置后仅采集匹配规则的接口。
 
     Returns:
         接口记录列表。每条记录包含 method、url、headers、body 预览等字段。
@@ -212,20 +443,68 @@ def capture_api_requests(page_url, wait_seconds=8, interactive=True):
     seen = set()
     capturing = True
     stop_event = threading.Event()
+    normalized_url_filters = _normalize_url_filters(url_filters)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False, slow_mo=50)
 
-        context = browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            user_agent=(
+        context_options = {
+            "viewport": {"width": 1366, "height": 768},
+            "user_agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
+        }
+        storage_state_loaded = False
+        if (
+            cookie_file
+            and not refresh_cookie
+            and _is_playwright_storage_state_file(cookie_file)
+        ):
+            context_options["storage_state"] = str(Path(cookie_file))
+            storage_state_loaded = True
+
+        context = browser.new_context(**context_options)
+
+        needs_manual_login = bool(cookie_file) and (
+            refresh_cookie or not _cookie_file_ready(cookie_file)
         )
 
+        if (
+            cookie_file
+            and not refresh_cookie
+            and not storage_state_loaded
+            and _cookie_file_ready(cookie_file)
+        ):
+            cookies = load_cookies_from_file(cookie_file, page_url)
+            if cookies:
+                context.add_cookies(cookies)
+                print(f"已加载 {len(cookies)} 个 cookie：{cookie_file}")
+            else:
+                print(f"未从 cookie 文件读取到有效 cookie：{cookie_file}")
+                needs_manual_login = True
+        elif storage_state_loaded:
+            print(f"已加载登录态：{cookie_file}")
+
+        if normalized_url_filters:
+            print(f"已启用接口 URL 过滤：{', '.join(normalized_url_filters)}")
+
         page = context.new_page()
+
+        try:
+            if needs_manual_login:
+                login_page_url = login_url or page_url
+                print("=" * 60)
+                print("未找到可用登录态，已进入首次登录流程")
+                print(f"请在浏览器中完成登录：{login_page_url}")
+                print("登录成功并确认页面已进入登录后状态后，回到终端按 Enter")
+                print("=" * 60)
+                page.goto(login_page_url, wait_until="domcontentloaded", timeout=60000)
+                input("登录完成后按 Enter 保存登录态并开始采集...")
+                _save_storage_state(context, cookie_file)
+        except Exception as e:
+            print(f"登录态保存异常：{e}")
 
         def handle_response(response):
             """Playwright 响应回调：过滤、去重并序列化单条接口记录。"""
@@ -239,6 +518,9 @@ def capture_api_requests(page_url, wait_seconds=8, interactive=True):
                     return
 
                 if is_static_resource(request.url):
+                    return
+
+                if not url_matches_filters(request.url, normalized_url_filters):
                     return
 
                 post_body = safe_get_post_data(request)

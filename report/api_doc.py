@@ -28,6 +28,15 @@ def generate_markdown_doc(analysis_results):
         md += f"**接口域名：** `{source.get('domain')}`\n\n"
         md += f"**接口说明：** {analysis.get('description', '')}\n\n"
         md += f"**置信度：** `{analysis.get('confidence', 'unknown')}`\n\n"
+        include_in_tests = item.get("include_in_tests", True)
+        md += f"**是否生成接口测试：** {'是' if include_in_tests else '否'}\n\n"
+        if not include_in_tests:
+            md += f"**跳过测试原因：** {item.get('test_skip_reason') or '未填写'}\n\n"
+        tags = item.get("tags") or []
+        if tags:
+            md += f"**标签：** {', '.join(tags)}\n\n"
+        if item.get("kb_notes"):
+            md += f"**知识库备注：** {item.get('kb_notes')}\n\n"
 
         md += _render_params_table(analysis.get("request_params", []))
         md += _render_fields_table(analysis.get("response_fields", []))
