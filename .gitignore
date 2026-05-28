@@ -6,6 +6,10 @@ venv/
 .env
 cookies*.json
 storage_state*.json
+config/*.json
+config/*.txt
+config/*.env
+!config/README.md
 docs/api_knowledge_base.json
 docs/api_doc.md
 docs/test_report.md

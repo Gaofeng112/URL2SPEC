@@ -133,6 +133,29 @@ def test_enrich_success_criteria_handles_repr_string_code_200():
     assert "code" in enriched["json"]["must_exist_paths"]
 
 
+def test_enrich_success_criteria_does_not_treat_404_as_ok_code():
+    raw = {
+        "response_body_preview": "{'data': 'encrypted', 'code': 404, 'msg': '未找到数据'}",
+        "content_type": "text/html; charset=utf-8",
+    }
+    criteria = {
+        "json": {
+            "must_exist_paths": [],
+            "success_path": "data",
+            "success_values": ["encrypted"],
+            "code_path": "code",
+            "ok_codes": [0],
+        }
+    }
+
+    enriched = enrich_success_criteria_from_capture(raw, criteria)
+
+    assert enriched["json"]["ok_codes"] == []
+    assert enriched["json"]["sample_error_code"] == 404
+    assert enriched["json"]["success_path"] == ""
+    assert "success_values" not in enriched["json"]
+
+
 def test_build_parameter_rules_adds_observed_query_params():
     rules = build_parameter_rules(
         {"parameter_rules": []},

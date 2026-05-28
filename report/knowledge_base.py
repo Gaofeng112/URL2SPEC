@@ -20,6 +20,13 @@ PRESERVED_FIELDS = (
     "locked",
     "manual_overrides",
 )
+COMMON_API_PATTERNS = (
+    ("api/config/*", "公共配置接口，无需加入接口回放测试", ["common", "config"]),
+    ("api/search/config", "搜索配置接口，无需加入接口回放测试", ["common", "config"]),
+    ("api/ad", "广告接口，无需加入接口回放测试", ["common", "ad"]),
+    ("api/synclogin/*", "登录同步接口依赖会话/签名，回放测试不稳定", ["common", "auth"]),
+    ("resources/*", "静态资源接口，无需加入接口回放测试", ["common", "static"]),
+)
 
 
 def load_api_knowledge_base(kb_file):
@@ -47,9 +54,9 @@ def save_api_knowledge_base(kb, kb_file):
     )
 
 
-def merge_api_knowledge_base(analysis_results, kb_file, skip_test_filters=None):
+def merge_api_knowledge_base(analysis_results, kb_file, skip_test_filters=None, overwrite=False):
     """将本次分析结果合并进固定知识库，并返回可用于文档/测试的结果列表。"""
-    kb = load_api_knowledge_base(kb_file)
+    kb = {"version": KB_VERSION, "apis": []} if overwrite else load_api_knowledge_base(kb_file)
     existing = {_entry_key(entry): entry for entry in kb.get("apis", [])}
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -60,6 +67,7 @@ def merge_api_knowledge_base(analysis_results, kb_file, skip_test_filters=None):
         if previous:
             entry = _merge_entry(previous, entry, skip_test_filters)
         else:
+            entry = _apply_common_api_defaults(entry)
             entry = _apply_skip_filters(entry, skip_test_filters)
         existing[key] = entry
 
@@ -164,6 +172,27 @@ def _apply_manual_overrides(entry):
     return entry
 
 
+def _add_tags(entry, tags):
+    current = list(entry.get("tags") or [])
+    for tag in tags:
+        if tag not in current:
+            current.append(tag)
+    entry["tags"] = current
+    return entry
+
+
+def _apply_common_api_defaults(entry):
+    raw_url = (entry.get("raw") or {}).get("url") or entry.get("path") or ""
+    path = entry.get("path") or raw_url
+    for pattern, reason, tags in COMMON_API_PATTERNS:
+        if url_matches_filters(raw_url, [pattern]) or url_matches_filters(path, [pattern]):
+            entry["include_in_tests"] = False
+            entry["test_skip_reason"] = entry.get("test_skip_reason") or reason
+            entry = _add_tags(entry, tags + ["low_value_test"])
+            break
+    return entry
+
+
 def _apply_skip_filters(entry, skip_test_filters):
     filters = skip_test_filters or []
     raw_url = (entry.get("raw") or {}).get("url") or entry.get("path") or ""
@@ -174,6 +203,7 @@ def _apply_skip_filters(entry, skip_test_filters):
     ):
         entry["include_in_tests"] = False
         entry["test_skip_reason"] = entry.get("test_skip_reason") or "匹配公共接口过滤规则"
+        entry = _add_tags(entry, ["common"])
     return entry
 
 

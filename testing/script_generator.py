@@ -93,6 +93,23 @@ def _parse_response_preview(raw):
     return None
 
 
+SUCCESS_CODE_VALUES = {0, 1, 200, "0", "1", "200", True}
+ERROR_CODE_VALUES = {400, 401, 403, 404, 405, 422, 429, 500, 502, 503}
+
+
+def _is_success_code(value):
+    return value in SUCCESS_CODE_VALUES
+
+
+def _is_error_like_code(value):
+    if value in ERROR_CODE_VALUES:
+        return True
+    if isinstance(value, int) and 400 <= value < 600:
+        return True
+    text = str(value).strip()
+    return text.isdigit() and 400 <= int(text) < 600
+
+
 def enrich_success_criteria_from_capture(raw, success_criteria):
     """用抓包样本校正业务断言，避免 LLM 臆造 ok_codes=200 而样本为 401。"""
     observed = _parse_response_preview(raw)
@@ -111,9 +128,14 @@ def enrich_success_criteria_from_capture(raw, success_criteria):
 
     if "code" in observed:
         json_criteria["code_path"] = json_criteria.get("code_path") or "code"
-        json_criteria["ok_codes"] = [observed["code"]]
-        # 样本为错误码时，不用 LLM 臆造的 data 成功值做断言
-        if observed["code"] not in (0, 200, "0", "200"):
+        observed_code = observed["code"]
+        if _is_success_code(observed_code):
+            json_criteria["ok_codes"] = [observed_code]
+        elif _is_error_like_code(observed_code):
+            json_criteria["ok_codes"] = []
+            json_criteria["sample_error_code"] = observed_code
+        # 样本为错误码时，不用 LLM 臆造的业务成功断言
+        if not _is_success_code(observed_code):
             json_criteria.pop("success_values", None)
             if json_criteria.get("success_path") in ("data", "result", "payload"):
                 json_criteria["success_path"] = ""
@@ -438,6 +460,9 @@ def _render_test_functions(case):
         "        success_values = json_criteria.get('success_values') or []",
         "        code_path = (json_criteria.get('code_path') or '').strip()",
         "        ok_codes = json_criteria.get('ok_codes') or []",
+        "        sample_error_code = json_criteria.get('sample_error_code')",
+        "        if sample_error_code is not None:",
+        "            pytest.skip(f'抓包样本业务码为 {sample_error_code}，不是可验证成功正例')",
         "        if success_path and success_values:",
         "            v = _get_by_path(data, success_path)",
         "            assert v in success_values, f\"业务成功字段 {success_path}={v}，期望 in {success_values}\"",

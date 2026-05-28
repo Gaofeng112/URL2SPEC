@@ -5,6 +5,7 @@ import fnmatch
 import hashlib
 import json
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
@@ -267,7 +268,43 @@ def url_matches_filters(url, url_filters):
 def _wait_for_interactive_stop(page, stop_event, poll_ms=300):
     """在交互模式下轮询等待用户结束信号，同时保持 Playwright 事件循环活跃。"""
     while not stop_event.is_set():
-        page.wait_for_timeout(poll_ms)
+        try:
+            if page.is_closed():
+                stop_event.set()
+                break
+            page.wait_for_timeout(poll_ms)
+        except Exception:
+            stop_event.set()
+            break
+
+
+def _wait_for_enter_or_page_close(page, prompt, poll_ms=300, on_poll=None):
+    """等待用户按 Enter，或在页面被关闭时自动结束等待。"""
+    stop_event = threading.Event()
+    last_poll_at = 0
+
+    def wait_for_enter():
+        try:
+            input(prompt)
+        except EOFError:
+            pass
+        finally:
+            stop_event.set()
+
+    threading.Thread(target=wait_for_enter, daemon=True).start()
+    while not stop_event.is_set():
+        try:
+            now = time.monotonic()
+            if on_poll and now - last_poll_at >= 2:
+                on_poll()
+                last_poll_at = now
+            if page.is_closed():
+                stop_event.set()
+                break
+            page.wait_for_timeout(poll_ms)
+        except Exception:
+            stop_event.set()
+            break
 
 
 def _target_cookie_url(page_url):
@@ -403,12 +440,27 @@ def _is_playwright_storage_state_file(cookie_file):
     )
 
 
-def _save_storage_state(context, cookie_file):
+def _storage_state_has_data(storage_state):
+    if not isinstance(storage_state, dict):
+        return False
+    if storage_state.get("cookies"):
+        return True
+    return any(origin.get("localStorage") for origin in storage_state.get("origins", []))
+
+
+def _save_storage_state(context, cookie_file, quiet=False):
     path = Path(cookie_file)
     if path.parent != Path("."):
         path.parent.mkdir(parents=True, exist_ok=True)
-    context.storage_state(path=str(path))
-    print(f"已保存登录态：{path}")
+    storage_state = context.storage_state()
+    if not _storage_state_has_data(storage_state):
+        if not quiet:
+            print("未保存登录态：当前浏览器上下文没有可保存的 cookie/localStorage")
+        return False
+    path.write_text(json.dumps(storage_state, ensure_ascii=False, indent=2), encoding="utf-8")
+    if not quiet:
+        print(f"已保存登录态：{path}")
+    return True
 
 
 def load_cookies_from_file(cookie_file, page_url):
@@ -483,6 +535,7 @@ def capture_api_requests(
     api_records = []
     seen = set()
     capturing = True
+    skip_capture = False
     stop_event = threading.Event()
     normalized_url_filters = _normalize_url_filters(url_filters)
 
@@ -511,6 +564,7 @@ def capture_api_requests(
         needs_manual_login = bool(cookie_file) and (
             refresh_cookie or not _cookie_file_ready(cookie_file)
         )
+        should_save_storage_state = bool(cookie_file)
 
         if (
             cookie_file
@@ -528,6 +582,9 @@ def capture_api_requests(
         elif storage_state_loaded:
             print(f"已加载登录态：{cookie_file}")
 
+        if cookie_file:
+            print(f"登录态文件：{cookie_file}")
+
         if normalized_url_filters:
             print(f"已启用接口 URL 过滤：{', '.join(normalized_url_filters)}")
 
@@ -542,8 +599,15 @@ def capture_api_requests(
                 print("登录成功并确认页面已进入登录后状态后，回到终端按 Enter")
                 print("=" * 60)
                 page.goto(login_page_url, wait_until="domcontentloaded", timeout=60000)
-                input("登录完成后按 Enter 保存登录态并开始采集...")
+                _wait_for_enter_or_page_close(
+                    page,
+                    "登录完成后按 Enter 保存登录态并开始采集...",
+                    on_poll=lambda: _save_storage_state(context, cookie_file, quiet=True),
+                )
                 _save_storage_state(context, cookie_file)
+                if page.is_closed():
+                    print("检测到页面已关闭，登录态已保存，本次采集结束")
+                    skip_capture = True
         except Exception as e:
             print(f"登录态保存异常：{e}")
 
@@ -660,15 +724,21 @@ def capture_api_requests(
             print("=" * 60)
 
         try:
-            page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
-            if interactive:
-                _wait_for_interactive_stop(page, stop_event)
-            else:
-                page.wait_for_timeout(wait_seconds * 1000)
+            if not skip_capture:
+                page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
+                if interactive:
+                    _wait_for_interactive_stop(page, stop_event)
+                else:
+                    page.wait_for_timeout(wait_seconds * 1000)
         except Exception as e:
             print(f"页面访问异常：{e}")
         finally:
             capturing = False
+            if should_save_storage_state:
+                try:
+                    _save_storage_state(context, cookie_file)
+                except Exception as e:
+                    print(f"登录态自动保存异常：{e}")
             try:
                 page.wait_for_timeout(500)
             except Exception:

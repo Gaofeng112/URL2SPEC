@@ -179,6 +179,11 @@ def generate_markdown_report(result, output_path, test_cases=None):
         md += _render_response_params(api)
         if case.get("message"):
             md += f"**失败/跳过说明：** {case.get('message')}\n\n"
+        if case.get("detail") and case.get("status") in ("failed", "error"):
+            detail = case.get("detail")
+            if len(detail) > 1200:
+                detail = detail[:1200] + "\n..."
+            md += f"失败详情：\n\n```text\n{detail}\n```\n\n"
 
     path = Path(output_path)
     path.write_text(md, encoding="utf-8")

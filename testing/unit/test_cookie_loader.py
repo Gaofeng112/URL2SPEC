@@ -1,6 +1,8 @@
 import json
+from pathlib import Path
 
-from capture.capture import load_cookies_from_file
+from capture.capture import _storage_state_has_data, load_cookies_from_file
+from main import default_cookie_file_for_url
 
 
 def write_text(path, text):
@@ -40,6 +42,29 @@ def test_load_playwright_storage_state(tmp_path):
             "sameSite": "Lax",
         }
     ]
+
+
+def test_default_cookie_file_uses_target_site():
+    cookie_file = default_cookie_file_for_url("https://vip.yaozh.com/member")
+
+    assert Path(cookie_file).as_posix() == "config/vip.yaozh.com.storage_state.json"
+
+
+def test_default_cookie_file_keeps_port_when_present():
+    cookie_file = default_cookie_file_for_url("http://localhost:8000/app")
+
+    assert Path(cookie_file).as_posix() == "config/localhost_8000.storage_state.json"
+
+
+def test_storage_state_has_data_for_cookies_or_local_storage():
+    assert _storage_state_has_data({"cookies": [{"name": "sid"}], "origins": []})
+    assert _storage_state_has_data(
+        {
+            "cookies": [],
+            "origins": [{"origin": "https://example.com", "localStorage": [{"name": "token"}]}],
+        }
+    )
+    assert not _storage_state_has_data({"cookies": [], "origins": []})
 
 
 def test_load_simple_cookie_header(tmp_path):

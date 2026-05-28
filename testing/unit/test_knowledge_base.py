@@ -83,6 +83,37 @@ def test_merge_knowledge_base_marks_common_api_by_filter(tmp_path):
     assert "公共接口" in results[0]["test_skip_reason"]
 
 
+def test_merge_knowledge_base_applies_common_api_defaults(tmp_path):
+    kb_file = tmp_path / "api_knowledge_base.json"
+
+    results = merge_api_knowledge_base(
+        [make_result(path="/api/config/navv2")],
+        kb_file,
+    )
+
+    assert results[0]["include_in_tests"] is False
+    assert "配置接口" in results[0]["test_skip_reason"]
+    assert "common" in results[0]["tags"]
+    assert "low_value_test" in results[0]["tags"]
+
+
+def test_merge_knowledge_base_preserves_manual_include_decision(tmp_path):
+    kb_file = tmp_path / "api_knowledge_base.json"
+    merge_api_knowledge_base([make_result(path="/api/config/navv2")], kb_file)
+
+    data = json.loads(kb_file.read_text(encoding="utf-8"))
+    data["apis"][0]["include_in_tests"] = True
+    data["apis"][0]["test_skip_reason"] = ""
+    data["apis"][0]["tags"] = ["manual_core"]
+    kb_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    results = merge_api_knowledge_base([make_result(path="/api/config/navv2")], kb_file)
+
+    assert results[0]["include_in_tests"] is True
+    assert results[0]["test_skip_reason"] == ""
+    assert results[0]["tags"] == ["manual_core"]
+
+
 def test_known_api_keys_can_skip_repeated_llm_analysis(tmp_path):
     kb_file = tmp_path / "api_knowledge_base.json"
     merge_api_knowledge_base([make_result()], kb_file)
@@ -95,3 +126,18 @@ def test_known_api_keys_can_skip_repeated_llm_analysis(tmp_path):
     })
 
     assert current_key in known_keys
+
+
+def test_merge_knowledge_base_overwrite_replaces_existing_entries(tmp_path):
+    kb_file = tmp_path / "api_knowledge_base.json"
+    merge_api_knowledge_base([make_result(path="/api/old")], kb_file)
+
+    results = merge_api_knowledge_base(
+        [make_result(path="/api/new")],
+        kb_file,
+        overwrite=True,
+    )
+    kb = load_api_knowledge_base(kb_file)
+
+    assert [api["path"] for api in kb["apis"]] == ["/api/new"]
+    assert [item["source"]["path"] for item in results] == ["/api/new"]

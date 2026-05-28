@@ -8,6 +8,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -27,6 +28,7 @@ OUTPUT_DIR = Path("output")
 DATA_DIR = OUTPUT_DIR / "data"
 RUN_REPORT_DIR = OUTPUT_DIR / "reports"
 TESTS_DIR = OUTPUT_DIR / "generated_tests"
+CONFIG_DIR = Path("config")
 DOCS_DIR = Path("docs")
 API_DOC_PATH = DOCS_DIR / "api_doc.md"
 TEST_REPORT_PATH = DOCS_DIR / "test_report.md"
@@ -48,7 +50,7 @@ def parse_args():
     parser.add_argument(
         "--cookie-file",
         default=os.getenv("CAPTURE_COOKIE_FILE"),
-        help="登录态文件路径；不存在时会先手动登录一次并保存，也可通过 CAPTURE_COOKIE_FILE 配置",
+        help="登录态文件路径；默认按目标域名保存到 config/，也可通过 CAPTURE_COOKIE_FILE 配置",
     )
     parser.add_argument(
         "--login-url",
@@ -58,7 +60,7 @@ def parse_args():
     parser.add_argument(
         "--refresh-cookie",
         action="store_true",
-        help="忽略现有登录态，重新登录并覆盖保存到 --cookie-file",
+        help="忽略现有登录态，重新登录并覆盖保存到当前登录态文件",
     )
     parser.add_argument(
         "--url-filter",
@@ -77,10 +79,30 @@ def parse_args():
         default=_parse_csv_env("COMMON_API_FILTERS"),
         help="匹配通配符的接口写入知识库但不生成测试，可重复传入；示例：api/common/*",
     )
+    parser.add_argument(
+        "--rebuild-kb",
+        action="store_true",
+        help="忽略已有知识库，本次抓到的接口全部重新分析，并覆盖写入知识库后再测试",
+    )
     args = parser.parse_args()
-    if args.refresh_cookie and not args.cookie_file:
-        parser.error("--refresh-cookie 需要同时指定 --cookie-file")
+    if not args.cookie_file:
+        args.cookie_file = default_cookie_file_for_url(args.page_url)
     return args
+
+
+def default_cookie_file_for_url(page_url):
+    """按目标站点生成默认登录态文件，避免每次命令都传 --cookie-file。"""
+    parsed = urlparse(page_url)
+    site = parsed.hostname or parsed.netloc or parsed.path
+    try:
+        if parsed.port:
+            site = f"{site}_{parsed.port}"
+    except ValueError:
+        pass
+    safe_site = "".join(ch if ch.isalnum() or ch in ".-" else "_" for ch in site).strip("._-")
+    if not safe_site:
+        safe_site = "default"
+    return str(CONFIG_DIR / f"{safe_site}.storage_state.json")
 
 
 def _parse_csv_env(name):
@@ -162,13 +184,17 @@ def main():
     with open(DATA_DIR / "api_records_clean.json", "w", encoding="utf-8") as f:
         json.dump(llm_inputs, f, ensure_ascii=False, indent=2)
 
-    new_raw_records, new_llm_inputs, skipped_known = split_new_api_records(
-        raw_records,
-        llm_inputs,
-        args.kb_file,
-    )
-    if skipped_known:
-        print(f"已跳过 {len(skipped_known)} 个知识库已有接口，避免重复 LLM 分析")
+    if args.rebuild_kb:
+        new_raw_records, new_llm_inputs, skipped_known = raw_records, llm_inputs, []
+        print("已启用知识库重建：忽略已有知识库，本次接口将全部重新分析并覆盖保存")
+    else:
+        new_raw_records, new_llm_inputs, skipped_known = split_new_api_records(
+            raw_records,
+            llm_inputs,
+            args.kb_file,
+        )
+        if skipped_known:
+            print(f"已跳过 {len(skipped_known)} 个知识库已有接口，避免重复 LLM 分析")
 
     if not new_llm_inputs:
         if not llm_inputs:
@@ -213,6 +239,7 @@ def main():
         analysis_results,
         args.kb_file,
         skip_test_filters=args.skip_test_filter,
+        overwrite=args.rebuild_kb,
     )
     with open(DATA_DIR / "api_knowledge_base_snapshot.json", "w", encoding="utf-8") as f:
         json.dump(kb_results, f, ensure_ascii=False, indent=2)

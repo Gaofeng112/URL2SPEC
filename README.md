@@ -14,7 +14,7 @@ URL2SPEC/
 │   ├── script_generator.py
 │   ├── runner.py
 │   └── unit/            # 项目 pytest 单元测试
-├── test/                # 用户自定义脚本（勿放核心代码）
+├── config/              # 本地配置目录：登录态、cookie、私有运行配置（git 忽略敏感文件）
 ├── docs/                # 文档：需求说明、知识库模板、生成的接口/测试文档
 └── output/              # 中间运行产物（git 忽略）
     ├── data/
@@ -34,32 +34,32 @@ python main.py "https://vip.yaozh.com"
 
 ### 首次登录并保存 Cookie
 
-如果还没有 cookie 文件，直接指定一个保存路径。程序会先打开浏览器登录页，手动登录完成后回到终端按 Enter，登录态会保存到该文件；随后自动进入目标页开始采集。
+默认不需要额外传 `--cookie-file`。程序会按目标域名自动使用本地登录态文件，例如 `https://vip.yaozh.com` 会使用 `config/vip.yaozh.com.storage_state.json`。
 
 ```bash
-python main.py "https://vip.yaozh.com" --cookie-file "./cookies.json"
+python main.py "https://vip.yaozh.com"
 ```
 
-如果登录页和目标页不同，可以额外指定登录页：
+如果本地还没有登录态文件，程序会先打开浏览器登录页。手动登录完成后回到终端按 Enter，登录态会自动保存；下次再运行同一个目标站点时，会直接加载本地登录态绕过登录。
+
+如果登录页和目标页不同，可以额外指定登录页，仍然不需要传 cookie 文件：
 
 ```bash
-python main.py "https://vip.yaozh.com/member" \
-  --cookie-file "./cookies.json" \
-  --login-url "https://vip.yaozh.com/login"
+python main.py "https://vip.yaozh.com/member" --login-url "https://vip.yaozh.com/login"
 ```
 
-后续再次运行同一个命令时，会优先加载 `./cookies.json`，直接绕过登录。若 cookie 过期，可强制重新登录并覆盖保存：
+若 cookie 过期，可强制重新登录并覆盖默认登录态文件：
 
 ```bash
-python main.py "https://vip.yaozh.com" --cookie-file "./cookies.json" --refresh-cookie
+python main.py "https://vip.yaozh.com" --refresh-cookie
 ```
 
-生成 pytest 接口回放测试时，也会自动复用 `--cookie-file` 中的 cookie，避免测试请求因缺少登录态变成无效 401/未登录响应。
+生成 pytest 接口回放测试时，也会自动复用同一个登录态文件，避免测试请求因缺少登录态变成无效 401/未登录响应。
 
-也可以在 `.env` 中配置默认路径：
+如需和旧流程兼容，仍可手动指定固定路径，或在 `.env` 中配置：
 
 ```env
-CAPTURE_COOKIE_FILE=./cookies.json
+CAPTURE_COOKIE_FILE=config/vip.yaozh.com.storage_state.json
 CAPTURE_LOGIN_URL=https://vip.yaozh.com/login
 ```
 
@@ -123,6 +123,30 @@ docs/api_knowledge_base.json
 
 后续再次采集时，程序会先用知识库判断接口是否已处理过。已存在的接口会跳过 LLM 分析，只有新增接口才会调用 LLM；如果本次没有新增接口，则直接基于现有知识库重新生成文档和测试。
 
+新增接口进入知识库时，会自动把一些低价值回放接口标记为公共接口并跳过测试，例如：
+
+- `api/config/*`：页面配置、导航、续费、公告等配置接口
+- `api/search/config`：搜索配置接口
+- `api/ad`：广告接口
+- `api/synclogin/*`：依赖会话、时间戳或签名的登录同步接口
+- `resources/*`：静态资源接口
+
+自动标记只作用于新接口。你在知识库里人工维护过的 `include_in_tests`、`test_skip_reason`、`tags` 会被保留；如果某个接口虽然像公共接口但你想长期纳入测试，可手动改为：
+
+```json
+{
+  "include_in_tests": true,
+  "test_skip_reason": "",
+  "tags": ["core"]
+}
+```
+
+如果希望完全忽略旧知识库，并用本次抓到的接口重新分析、覆盖知识库，再生成测试，可使用：
+
+```bash
+python main.py "https://vip.yaozh.com" --rebuild-kb
+```
+
 示例：公共接口只进入文档，不生成 pytest：
 
 ```json
@@ -151,5 +175,4 @@ COMMON_API_FILTERS=api/common/*,api/dict/*
 | 类型 | 位置 | 命令 |
 |------|------|------|
 | 项目单元测试 | `testing/unit/` | `pytest` |
-| 用户脚本 | `test/` | `python test/example_capture.py` |
 | 流水线生成的接口测试 | `output/generated_tests/` | 由 `main.py` 自动执行 |

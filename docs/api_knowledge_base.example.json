@@ -9,7 +9,7 @@
       "include_in_tests": true,
       "test_skip_reason": "",
       "tags": ["example"],
-      "kb_notes": "示例接口，请复制为 docs/api_knowledge_base.json 后维护真实知识库。",
+      "kb_notes": "示例接口，请复制为 docs/api_knowledge_base.json 后维护真实知识库。公共/低价值接口可将 include_in_tests 改为 false；核心接口可加 tags: [\"core\"]。",
       "locked": false,
       "manual_overrides": {},
       "source": {
