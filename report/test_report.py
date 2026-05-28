@@ -97,7 +97,37 @@ def generate_json_report(result, output_path):
     return str(path)
 
 
-def generate_markdown_report(result, output_path):
+def enrich_report_with_api_details(result, test_cases):
+    """将测试用例元数据挂到 JUnit 解析结果中。"""
+    if not result:
+        return result
+
+    case_map = {}
+    for case in test_cases or []:
+        func_name = case.get("func_name")
+        if not func_name:
+            continue
+        detail = {
+            "api_name": case.get("api_name", ""),
+            "method": case.get("method", ""),
+            "url": case.get("url", ""),
+            "request_params": case.get("request_params") or case.get("parameter_rules") or [],
+            "parameter_rules": case.get("parameter_rules") or [],
+            "request_body": case.get("request_body"),
+            "response_fields": case.get("response_fields") or [],
+            "response_rules": case.get("response_rules") or {},
+        }
+        case_map[f"test_{func_name}_ok"] = detail
+        case_map[f"test_{func_name}_missing_required_param"] = detail
+
+    for case in result.get("cases", []):
+        detail = case_map.get(case.get("name", ""))
+        if detail:
+            case["api"] = detail
+    return result
+
+
+def generate_markdown_report(result, output_path, test_cases=None):
     """写入 Markdown 格式测试报告。
 
     Args:
@@ -107,7 +137,10 @@ def generate_markdown_report(result, output_path):
     Returns:
         写入的绝对路径字符串。
     """
-    result = result or {"summary": {}, "cases": []}
+    result = enrich_report_with_api_details(
+        result or {"summary": {}, "cases": []},
+        test_cases,
+    )
     summary = result.get("summary", {})
     cases = result.get("cases", [])
 
@@ -134,9 +167,75 @@ def generate_markdown_report(result, output_path):
             f"| {msg or '-'} |\n"
         )
 
+    md += "\n## 接口明细\n\n"
+    for index, case in enumerate(cases, start=1):
+        api = case.get("api") or {}
+        md += f"### {index}. `{case.get('name', '')}`\n\n"
+        md += f"- 状态：{case.get('status', '')}\n"
+        md += f"- 接口名称：{api.get('api_name') or '-'}\n"
+        md += f"- 请求方法：`{api.get('method') or '-'}`\n"
+        md += f"- 接口地址：`{api.get('url') or '-'}`\n\n"
+        md += _render_request_params(api)
+        md += _render_response_params(api)
+        if case.get("message"):
+            md += f"**失败/跳过说明：** {case.get('message')}\n\n"
+
     path = Path(output_path)
     path.write_text(md, encoding="utf-8")
     return str(path)
+
+
+def _render_request_params(api):
+    params = api.get("request_params") or api.get("parameter_rules") or []
+    body = api.get("request_body")
+    md = "**请求参数：**\n\n"
+    if params:
+        md += "| 参数名 | 位置 | 类型 | 是否必填 | 说明 |\n"
+        md += "|---|---|---|---|---|\n"
+        for param in params:
+            md += (
+                f"| {param.get('name', '')} "
+                f"| {param.get('in', '')} "
+                f"| {param.get('type', '')} "
+                f"| {param.get('required', '')} "
+                f"| {param.get('description', '')} |\n"
+            )
+        md += "\n"
+    else:
+        md += "无结构化请求参数\n\n"
+
+    if body:
+        preview = str(body)
+        if len(preview) > 500:
+            preview = preview[:500] + "..."
+        md += f"请求体样例：\n\n```text\n{preview}\n```\n\n"
+    return md
+
+
+def _render_response_params(api):
+    fields = api.get("response_fields") or []
+    rules = api.get("response_rules") or {}
+    md = "**响应参数：**\n\n"
+    if fields:
+        md += "| 字段名 | 类型 | 说明 |\n"
+        md += "|---|---|---|\n"
+        for field in fields:
+            md += (
+                f"| {field.get('name', '')} "
+                f"| {field.get('type', '')} "
+                f"| {field.get('description', '')} |\n"
+            )
+        md += "\n"
+    else:
+        paths = rules.get("must_exist_paths") or []
+        if paths:
+            md += "必须存在字段路径：\n\n"
+            for path in paths:
+                md += f"- `{path}`\n"
+            md += "\n"
+        else:
+            md += "无结构化响应参数\n\n"
+    return md
 
 
 def generate_html_report(result, output_path):

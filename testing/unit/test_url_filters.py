@@ -1,3 +1,4 @@
+from capture.capture import is_static_resource
 from capture import url_matches_filters
 
 
@@ -38,3 +39,7 @@ def test_url_filter_matches_absolute_url():
         "https://api.example.com/api/zgqxss/list",
         ["https://api.example.com/api/zgqxss/*"],
     )
+
+
+def test_txt_file_is_static_resource():
+    assert is_static_resource("https://example.com/static/readme.txt")

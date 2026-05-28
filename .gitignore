@@ -1,12 +1,16 @@
 __pycache__/
 *.py[cod]
+.pytest_cache/
 .venv/
 venv/
 .env
 cookies*.json
 storage_state*.json
+docs/api_knowledge_base.json
 output/
 *.log
+.coverage
+htmlcov/
 playwright-report/
 test-results/
 pytest-cache-files*/

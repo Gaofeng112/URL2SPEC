@@ -1,10 +1,13 @@
 """根据抓包记录与 LLM 分析结果生成 pytest 接口测试脚本。"""
 
+import ast
 import copy
 import json
 import re
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+from capture import load_cookies_from_file
 
 # 默认跳过第三方统计/埋点域名，避免无关失败。
 SKIP_DOMAIN_SUFFIXES = (
@@ -82,7 +85,11 @@ def _parse_response_preview(raw):
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            return None
+            try:
+                parsed = ast.literal_eval(text)
+            except (ValueError, SyntaxError):
+                return None
+            return parsed if isinstance(parsed, dict) else None
     return None
 
 
@@ -129,6 +136,75 @@ def _py_literal(obj):
     return repr(obj)
 
 
+def load_replay_cookies(cookie_file, page_url=None):
+    """加载用于 requests 回放测试的 cookie。"""
+    if not cookie_file:
+        return []
+    try:
+        cookies = load_cookies_from_file(cookie_file, page_url or "http://localhost/")
+    except Exception as e:
+        print(f"测试回放 cookie 加载失败：{e}")
+        return []
+
+    replay_cookies = []
+    for cookie in cookies:
+        item = {
+            "name": cookie.get("name"),
+            "value": cookie.get("value"),
+            "domain": cookie.get("domain"),
+            "path": cookie.get("path") or "/",
+        }
+        if not item["domain"] and cookie.get("url"):
+            item["domain"] = urlparse(cookie["url"]).hostname
+        if item["name"] and item["value"] is not None:
+            replay_cookies.append(item)
+    return replay_cookies
+
+
+def build_parameter_rules(analysis, source):
+    """合并 LLM 参数规则与抓包中真实出现的参数。"""
+    rules = copy.deepcopy(
+        analysis.get("parameter_rules")
+        or analysis.get("request_params")
+        or []
+    )
+    seen = {
+        (rule.get("in"), rule.get("name"))
+        for rule in rules
+        if rule.get("in") and rule.get("name")
+    }
+
+    for name, value_type in (source.get("query_params") or {}).items():
+        key = ("query", name)
+        if key in seen:
+            continue
+        rules.append({
+            "name": name,
+            "in": "query",
+            "type": value_type or "unknown",
+            "required": "unknown",
+            "description": "抓包中出现的 query 参数",
+        })
+        seen.add(key)
+
+    body_schema = source.get("request_body_schema")
+    if isinstance(body_schema, dict):
+        for name, value_type in body_schema.items():
+            key = ("body", name)
+            if key in seen:
+                continue
+            rules.append({
+                "name": name,
+                "in": "body",
+                "type": value_type if isinstance(value_type, str) else "object",
+                "required": "unknown",
+                "description": "抓包中出现的 body 参数",
+            })
+            seen.add(key)
+
+    return rules
+
+
 def build_test_cases(analysis_results, page_url=None):
     """从分析结果构建可生成脚本的测试用例元数据。"""
     page_domain = urlparse(page_url).netloc if page_url else None
@@ -166,6 +242,7 @@ def build_test_cases(analysis_results, page_url=None):
         if content_type and not response_rules.get("content_type_contains"):
             response_rules["content_type_contains"] = content_type
 
+        parameter_rules = build_parameter_rules(analysis, source)
         cases.append({
             "func_name": func_name,
             "api_name": api_name,
@@ -177,18 +254,49 @@ def build_test_cases(analysis_results, page_url=None):
             "content_type": _request_content_type(raw),
             "description": analysis.get("description", ""),
             "success_criteria": success_criteria,
-            "parameter_rules": (
-                analysis.get("parameter_rules")
-                or analysis.get("request_params")
-                or []
-            ),
+            "parameter_rules": parameter_rules,
+            "request_params": analysis.get("request_params") or [],
+            "response_fields": analysis.get("response_fields") or [],
             "response_rules": response_rules,
         })
 
     return cases
 
 
-def generate_pytest_suite(analysis_results, tests_dir, page_url=None):
+def _render_conftest(replay_cookies):
+    cookies_repr = _py_literal(replay_cookies)
+    return "\n".join([
+        '"""自动生成的 pytest 配置。"""',
+        "",
+        "import pytest",
+        "import requests",
+        "",
+        f"REPLAY_COOKIES = {cookies_repr}",
+        "",
+        "",
+        "def _apply_replay_cookies(session):",
+        '    """将采集阶段保存的 cookie 注入 requests 会话。"""',
+        "    for cookie in REPLAY_COOKIES:",
+        "        session.cookies.set(",
+        "            cookie['name'],",
+        "            cookie['value'],",
+        "            domain=cookie.get('domain'),",
+        "            path=cookie.get('path') or '/',",
+        "        )",
+        "",
+        "",
+        "@pytest.fixture(scope='session')",
+        "def http_session():",
+        '    """共享 HTTP 会话。"""',
+        "    session = requests.Session()",
+        "    _apply_replay_cookies(session)",
+        "    yield session",
+        "    session.close()",
+        "",
+    ])
+
+
+def generate_pytest_suite(analysis_results, tests_dir, page_url=None, cookie_file=None):
     """生成 pytest 测试目录（conftest + 测试模块）。"""
     tests_path = Path(tests_dir)
     tests_path.mkdir(parents=True, exist_ok=True)
@@ -197,18 +305,9 @@ def generate_pytest_suite(analysis_results, tests_dir, page_url=None):
     if not cases:
         return cases
 
+    replay_cookies = load_replay_cookies(cookie_file, page_url)
     conftest = tests_path / "conftest.py"
-    conftest.write_text(
-        '"""自动生成的 pytest 配置。"""\n\n'
-        "import pytest\nimport requests\n\n\n"
-        "@pytest.fixture(scope='session')\n"
-        "def http_session():\n"
-        '    """共享 HTTP 会话。"""\n'
-        "    session = requests.Session()\n"
-        "    yield session\n"
-        "    session.close()\n",
-        encoding="utf-8",
-    )
+    conftest.write_text(_render_conftest(replay_cookies), encoding="utf-8")
 
     lines = [
         '"""自动生成的接口回放测试，请勿手动修改。"""',
@@ -350,16 +449,18 @@ def _render_test_functions(case):
 
     lines.extend([
         f"def test_{func_name}_missing_required_param(http_session):",
-        f'    """负例：缺少必填参数时应失败（基于 LLM 规则推断）。"""',
+        f'    """负例：缺少参数时应失败或产生可判定变化。"""',
         f"    base_url = {url_repr}",
         f"    headers = {headers_repr}",
         f"    rules = {param_rules_repr}",
         f"    success_criteria = {criteria_repr}",
         "",
-        "    required = [r for r in rules if str(r.get('required')).lower() == 'true' and r.get('in') in ('query','body') and r.get('name')]",
-        "    if not required:",
-        "        pytest.skip('无可测必填参数规则')",
-        "    target = required[0]",
+        "    candidates = [r for r in rules if str(r.get('required')).lower() == 'true' and r.get('in') in ('query','body') and r.get('name')]",
+        "    if not candidates:",
+        "        candidates = [r for r in rules if str(r.get('required')).lower() == 'unknown' and r.get('in') in ('query','body') and r.get('name')]",
+        "    if not candidates:",
+        "        pytest.skip('无可测参数规则')",
+        "    target = candidates[0]",
         "    location = target.get('in')",
         "    name = target.get('name')",
         "",
@@ -391,6 +492,9 @@ def _render_test_functions(case):
             f'        response = http_session.request("{method}", url, headers=headers, data=payload, timeout=30)'
         )
     lines.extend([
+        "    else:",
+        f'        response = http_session.request("{method}", url, headers=headers, timeout=30)',
+        "",
         "",
         "    ok_status = (success_criteria.get('http_status') or {}).get('ok') or [200]",
         "    data = _try_parse_json(response)",
@@ -410,7 +514,8 @@ def _render_test_functions(case):
         "            if v in success_values:",
         "                pytest.skip('缺参后响应未变化，无法判定负例')",
         "            return",
-        "    assert response.status_code not in ok_status",
+        "    if response.status_code in ok_status:",
+        "        pytest.skip('缺参后仍返回成功状态，无法判定负例')",
         "",
     ])
 

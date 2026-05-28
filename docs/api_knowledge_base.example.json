@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "apis": [
+    {
+      "id": "GET example.com /api/example",
+      "method": "GET",
+      "domain": "example.com",
+      "path": "/api/example",
+      "include_in_tests": true,
+      "test_skip_reason": "",
+      "tags": ["example"],
+      "kb_notes": "示例接口，请复制为 docs/api_knowledge_base.json 后维护真实知识库。",
+      "locked": false,
+      "manual_overrides": {},
+      "source": {
+        "method": "GET",
+        "domain": "example.com",
+        "path": "/api/example",
+        "query_params": {
+          "id": "number"
+        },
+        "request_body_schema": null,
+        "response_status": 200,
+        "response_content_type": "application/json",
+        "response_body_schema": {
+          "code": "number",
+          "data": "object",
+          "msg": "string"
+        }
+      },
+      "analysis": {
+        "api_name": "示例接口",
+        "description": "用于说明知识库结构的示例。",
+        "method": "GET",
+        "path": "/api/example",
+        "success_criteria": {
+          "http_status": {
+            "ok": [200],
+            "retryable": [429, 503]
+          },
+          "json": {
+            "must_exist_paths": ["code", "data"],
+            "success_path": "",
+            "success_values": [],
+            "code_path": "code",
+            "ok_codes": [0, 200],
+            "message_path": "msg"
+          }
+        },
+        "parameter_rules": [
+          {
+            "name": "id",
+            "in": "query",
+            "type": "number",
+            "required": "unknown",
+            "enum": [],
+            "min_length": null,
+            "max_length": null,
+            "pattern": "",
+            "description": "示例 ID"
+          }
+        ],
+        "request_params": [],
+        "response_fields": [
+          {
+            "name": "code",
+            "type": "number",
+            "description": "业务状态码"
+          },
+          {
+            "name": "data",
+            "type": "object",
+            "description": "响应数据"
+          }
+        ],
+        "response_rules": {
+          "content_type_contains": "application/json",
+          "json_schema_hint": null,
+          "must_exist_paths": ["code", "data"]
+        },
+        "possible_test_cases": [],
+        "confidence": "high",
+        "notes": []
+      },
+      "raw": {},
+      "created_at": "2026-05-28 00:00:00",
+      "updated_at": "2026-05-28 00:00:00"
+    }
+  ]
+}

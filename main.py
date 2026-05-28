@@ -84,9 +84,14 @@ def _parse_csv_env(name):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def run_test_pipeline(analysis_results, page_url):
+def run_test_pipeline(analysis_results, page_url, cookie_file=None):
     """生成测试脚本、执行 pytest 并输出报告。"""
-    test_cases = generate_pytest_suite(analysis_results, TESTS_DIR, page_url)
+    test_cases = generate_pytest_suite(
+        analysis_results,
+        TESTS_DIR,
+        page_url,
+        cookie_file=cookie_file,
+    )
     if not test_cases:
         print("未生成可执行测试（可能均为第三方埋点接口）")
         return 0
@@ -100,7 +105,7 @@ def run_test_pipeline(analysis_results, page_url):
         print(stderr, file=sys.stderr)
 
     result = parse_junit_xml(junit_path)
-    generate_markdown_report(result, f"{REPORT_DIR}/test_report.md")
+    generate_markdown_report(result, f"{REPORT_DIR}/test_report.md", test_cases=test_cases)
 
     summary = (result or {}).get("summary", {})
     print(
@@ -172,7 +177,7 @@ def main():
     with open(f"{REPORT_DIR}/api_doc.md", "w", encoding="utf-8") as f:
         f.write(markdown)
 
-    run_test_pipeline(kb_results, page_url)
+    run_test_pipeline(kb_results, page_url, cookie_file=args.cookie_file)
 
     print("处理完成")
     print(f"原始抓包数据：{DATA_DIR}/api_records_raw.json")

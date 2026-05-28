@@ -7,7 +7,7 @@ import json
 import threading
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from playwright.sync_api import sync_playwright
 
@@ -17,6 +17,7 @@ from capture.sanitizer import safe_preview_body, sanitize_headers
 STATIC_EXTENSIONS = (
     ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
     ".woff", ".woff2", ".ttf", ".map", ".webp", ".mp4", ".mp3",
+    ".txt",
 )
 
 # VIP 解密默认 key（可按需调整/外部传入）。
@@ -153,25 +154,65 @@ def safe_get_post_data(request):
         return None
 
 
-def post_data_dedup_key(request):
-    """生成用于去重的 POST 体摘要。
+def _value_shape(value):
+    if isinstance(value, dict):
+        return {
+            key: _value_shape(value[key])
+            for key in sorted(value.keys())
+        }
+    if isinstance(value, list):
+        if not value:
+            return ["empty"]
+        return [_value_shape(value[0])]
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    return "string"
 
-    Args:
-        request: Playwright ``Request`` 对象。
 
-    Returns:
-        字符串键片段。
-    """
-    body = safe_get_post_data(request)
+def _body_shape_key(body, headers=None):
     if body is not None:
-        return body
-    try:
-        buf = request.post_data_buffer
-        if buf:
-            return hashlib.md5(buf).hexdigest()
-    except Exception:
-        pass
+        text = body.strip() if isinstance(body, str) else str(body)
+        if not text:
+            return ""
+        try:
+            parsed = json.loads(text)
+            return json.dumps(_value_shape(parsed), ensure_ascii=False, sort_keys=True)
+        except json.JSONDecodeError:
+            pass
+
+        content_type = ""
+        for key, value in (headers or {}).items():
+            if key.lower() == "content-type":
+                content_type = value or ""
+                break
+        if "application/x-www-form-urlencoded" in content_type:
+            fields = sorted({key for key, _value in parse_qsl(text, keep_blank_values=True)})
+            return json.dumps({"form_fields": fields}, ensure_ascii=False, sort_keys=True)
+
+        return hashlib.md5(text.encode("utf-8", errors="ignore")).hexdigest()
+
     return ""
+
+
+def api_request_dedup_key(method, url, post_body=None, headers=None):
+    """生成接口级去重 key，忽略参数值，只保留接口结构。
+
+    同一路径下仅 query 值不同或 JSON body 值不同的请求，会被视为同一个接口。
+    """
+    parsed = urlparse(url)
+    query_fields = sorted({key for key, _value in parse_qsl(parsed.query, keep_blank_values=True)})
+    parts = {
+        "method": (method or "").upper(),
+        "domain": parsed.netloc,
+        "path": parsed.path,
+        "query_fields": query_fields,
+        "body_shape": _body_shape_key(post_body, headers),
+    }
+    return json.dumps(parts, ensure_ascii=False, sort_keys=True)
 
 
 def is_static_resource(url):
@@ -524,7 +565,12 @@ def capture_api_requests(
                     return
 
                 post_body = safe_get_post_data(request)
-                key = f"{request.method}:{request.url}:{post_data_dedup_key(request)}"
+                key = api_request_dedup_key(
+                    request.method,
+                    request.url,
+                    post_body=post_body,
+                    headers=request.headers,
+                )
                 if key in seen:
                     return
                 seen.add(key)

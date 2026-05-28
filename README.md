@@ -54,6 +54,8 @@ python main.py "https://vip.yaozh.com/member" \
 python main.py "https://vip.yaozh.com" --cookie-file "./cookies.json" --refresh-cookie
 ```
 
+生成 pytest 接口回放测试时，也会自动复用 `--cookie-file` 中的 cookie，避免测试请求因缺少登录态变成无效 401/未登录响应。
+
 也可以在 `.env` 中配置默认路径：
 
 ```env
@@ -91,6 +93,8 @@ python main.py "https://vip.yaozh.com" \
 CAPTURE_URL_FILTERS=api/zgqxss/*,api/user/*
 ```
 
+采集阶段会按接口结构自动去重：同一路径下 query 参数值不同、JSON body 字段值不同、form body 字段值不同的请求，只保留一条接口记录；如果参数名或 body 字段结构不同，则视为不同接口。
+
 ### 固定接口知识库
 
 每次采集和 LLM 分析完成后，会增量更新固定知识库，默认路径：
@@ -98,6 +102,8 @@ CAPTURE_URL_FILTERS=api/zgqxss/*,api/user/*
 ```text
 docs/api_knowledge_base.json
 ```
+
+真实知识库可能包含抓包样本、接口返回片段或用户数据，默认不提交到 Git；仓库中提供 `docs/api_knowledge_base.example.json` 作为结构模板。
 
 知识库按 `请求方法 + 域名 + 接口路径` 合并接口，适合长期维护和人工修订。常用字段：
 
