@@ -1,6 +1,11 @@
 import json
 
-from report.knowledge_base import load_api_knowledge_base, merge_api_knowledge_base
+from report.knowledge_base import (
+    build_api_key,
+    get_known_api_keys,
+    load_api_knowledge_base,
+    merge_api_knowledge_base,
+)
 from testing.script_generator import build_test_cases
 
 
@@ -76,3 +81,17 @@ def test_merge_knowledge_base_marks_common_api_by_filter(tmp_path):
 
     assert results[0]["include_in_tests"] is False
     assert "公共接口" in results[0]["test_skip_reason"]
+
+
+def test_known_api_keys_can_skip_repeated_llm_analysis(tmp_path):
+    kb_file = tmp_path / "api_knowledge_base.json"
+    merge_api_knowledge_base([make_result()], kb_file)
+
+    known_keys = get_known_api_keys(kb_file)
+    current_key = build_api_key({
+        "method": "GET",
+        "domain": "example.com",
+        "path": "/api/zgqxss/list",
+    })
+
+    assert current_key in known_keys

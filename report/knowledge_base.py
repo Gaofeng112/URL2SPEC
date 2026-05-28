@@ -63,9 +63,30 @@ def merge_api_knowledge_base(analysis_results, kb_file, skip_test_filters=None):
             entry = _apply_skip_filters(entry, skip_test_filters)
         existing[key] = entry
 
+    if skip_test_filters:
+        existing = {
+            key: _apply_skip_filters(entry, skip_test_filters)
+            for key, entry in existing.items()
+        }
+
     kb["apis"] = sorted(existing.values(), key=lambda item: item.get("id", ""))
     save_api_knowledge_base(kb, kb_file)
     return knowledge_base_to_analysis_results(kb)
+
+
+def get_known_api_keys(kb_file):
+    """读取知识库中已经处理过的接口 key。"""
+    kb = load_api_knowledge_base(kb_file)
+    return {_entry_key(entry) for entry in kb.get("apis", [])}
+
+
+def build_api_key(source):
+    """按现有知识库粒度生成接口 key：方法 + 域名 + 路径。"""
+    return _make_id(
+        source.get("method"),
+        source.get("domain"),
+        source.get("path"),
+    )
 
 
 def knowledge_base_to_analysis_results(kb):

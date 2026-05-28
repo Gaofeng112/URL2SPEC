@@ -7,6 +7,8 @@ venv/
 cookies*.json
 storage_state*.json
 docs/api_knowledge_base.json
+docs/api_doc.md
+docs/test_report.md
 output/
 *.log
 .coverage

@@ -9,16 +9,16 @@ URL2SPEC/
 ├── main.py              # 主入口
 ├── capture/             # 采集：Playwright 抓包、清洗、脱敏、VIP 解密
 ├── llm/                 # LLM 推理：提示词 + 客户端
-├── report/              # 报告：接口文档 Markdown、测试报告 Markdown
+├── report/              # 报告渲染代码：接口文档、测试报告、知识库合并
 ├── testing/             # 测试：脚本生成、pytest 执行、单元测试
 │   ├── script_generator.py
 │   ├── runner.py
 │   └── unit/            # 项目 pytest 单元测试
 ├── test/                # 用户自定义脚本（勿放核心代码）
-├── docs/
-└── output/              # 运行产物（git 忽略）
+├── docs/                # 文档：需求说明、知识库模板、生成的接口/测试文档
+└── output/              # 中间运行产物（git 忽略）
     ├── data/
-    ├── reports/
+    ├── reports/         # JUnit XML 等机器报告
     └── generated_tests/
 ```
 
@@ -105,6 +105,13 @@ docs/api_knowledge_base.json
 
 真实知识库可能包含抓包样本、接口返回片段或用户数据，默认不提交到 Git；仓库中提供 `docs/api_knowledge_base.example.json` 作为结构模板。
 
+生成的人工阅读文档默认输出到：
+
+- `docs/api_doc.md`
+- `docs/test_report.md`
+
+这两个文件由当前采集数据生成，默认不提交到 Git；如需沉淀正式版本，可人工脱敏后另存。
+
 知识库按 `请求方法 + 域名 + 接口路径` 合并接口，适合长期维护和人工修订。常用字段：
 
 - `include_in_tests`：是否生成接口测试，公共接口可改为 `false`
@@ -113,6 +120,8 @@ docs/api_knowledge_base.json
 - `kb_notes`：知识库维护备注
 - `locked`：设为 `true` 后后续采集不会覆盖该接口条目
 - `manual_overrides`：手动覆盖 `analysis`、`source`、`raw` 中的字段
+
+后续再次采集时，程序会先用知识库判断接口是否已处理过。已存在的接口会跳过 LLM 分析，只有新增接口才会调用 LLM；如果本次没有新增接口，则直接基于现有知识库重新生成文档和测试。
 
 示例：公共接口只进入文档，不生成 pytest：
 

@@ -7,24 +7,30 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 from capture import build_llm_input, capture_api_requests
 from llm import LLMClient
 from report import (
+    build_api_key,
     generate_markdown_doc,
     generate_markdown_report,
+    get_known_api_keys,
     merge_api_knowledge_base,
     parse_junit_xml,
 )
 from testing import generate_pytest_suite, run_pytest_suite
 
-OUTPUT_DIR = "output"
-DATA_DIR = f"{OUTPUT_DIR}/data"
-REPORT_DIR = f"{OUTPUT_DIR}/reports"
-TESTS_DIR = f"{OUTPUT_DIR}/generated_tests"
-DEFAULT_KB_FILE = "docs/api_knowledge_base.json"
+OUTPUT_DIR = Path("output")
+DATA_DIR = OUTPUT_DIR / "data"
+RUN_REPORT_DIR = OUTPUT_DIR / "reports"
+TESTS_DIR = OUTPUT_DIR / "generated_tests"
+DOCS_DIR = Path("docs")
+API_DOC_PATH = DOCS_DIR / "api_doc.md"
+TEST_REPORT_PATH = DOCS_DIR / "test_report.md"
+DEFAULT_KB_FILE = DOCS_DIR / "api_knowledge_base.json"
 
 
 def get_llm_config():
@@ -62,7 +68,7 @@ def parse_args():
     )
     parser.add_argument(
         "--kb-file",
-        default=os.getenv("API_KNOWLEDGE_BASE_FILE", DEFAULT_KB_FILE),
+        default=os.getenv("API_KNOWLEDGE_BASE_FILE", str(DEFAULT_KB_FILE)),
         help=f"固定接口知识库文件路径，默认 {DEFAULT_KB_FILE}",
     )
     parser.add_argument(
@@ -96,16 +102,16 @@ def run_test_pipeline(analysis_results, page_url, cookie_file=None):
         print("未生成可执行测试（可能均为第三方埋点接口）")
         return 0
 
-    print(f"已生成 {len(test_cases)} 条接口测试：{TESTS_DIR}/test_generated_api.py")
+    print(f"已生成 {len(test_cases)} 条接口测试：{TESTS_DIR / 'test_generated_api.py'}")
 
-    exit_code, junit_path, stdout, stderr = run_pytest_suite(TESTS_DIR, REPORT_DIR)
+    exit_code, junit_path, stdout, stderr = run_pytest_suite(TESTS_DIR, RUN_REPORT_DIR)
     if stdout:
         print(stdout)
     if stderr:
         print(stderr, file=sys.stderr)
 
     result = parse_junit_xml(junit_path)
-    generate_markdown_report(result, f"{REPORT_DIR}/test_report.md", test_cases=test_cases)
+    generate_markdown_report(result, TEST_REPORT_PATH, test_cases=test_cases)
 
     summary = (result or {}).get("summary", {})
     print(
@@ -115,13 +121,32 @@ def run_test_pipeline(analysis_results, page_url, cookie_file=None):
     return exit_code
 
 
+def split_new_api_records(raw_records, llm_inputs, kb_file):
+    """按知识库过滤已处理接口，仅返回需要 LLM 分析的新接口。"""
+    known_keys = get_known_api_keys(kb_file)
+    new_records = []
+    new_inputs = []
+    skipped = []
+
+    for raw_record, api_info in zip(raw_records, llm_inputs):
+        key = build_api_key(api_info)
+        if key in known_keys:
+            skipped.append(api_info)
+            continue
+        new_records.append(raw_record)
+        new_inputs.append(api_info)
+
+    return new_records, new_inputs, skipped
+
+
 def main():
     """执行完整的接口采集、分析与测试流水线。"""
     load_dotenv()
     args = parse_args()
     page_url = args.page_url
     os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(REPORT_DIR, exist_ok=True)
+    os.makedirs(RUN_REPORT_DIR, exist_ok=True)
+    os.makedirs(DOCS_DIR, exist_ok=True)
 
     raw_records = capture_api_requests(
         page_url,
@@ -130,38 +155,58 @@ def main():
         refresh_cookie=args.refresh_cookie,
         url_filters=args.url_filter,
     )
-    with open(f"{DATA_DIR}/api_records_raw.json", "w", encoding="utf-8") as f:
+    with open(DATA_DIR / "api_records_raw.json", "w", encoding="utf-8") as f:
         json.dump(raw_records, f, ensure_ascii=False, indent=2)
 
     llm_inputs = [build_llm_input(record) for record in raw_records]
-    with open(f"{DATA_DIR}/api_records_clean.json", "w", encoding="utf-8") as f:
+    with open(DATA_DIR / "api_records_clean.json", "w", encoding="utf-8") as f:
         json.dump(llm_inputs, f, ensure_ascii=False, indent=2)
+
+    new_raw_records, new_llm_inputs, skipped_known = split_new_api_records(
+        raw_records,
+        llm_inputs,
+        args.kb_file,
+    )
+    if skipped_known:
+        print(f"已跳过 {len(skipped_known)} 个知识库已有接口，避免重复 LLM 分析")
+
+    if not new_llm_inputs:
+        if not llm_inputs:
+            print("未捕获到任何 XHR/Fetch 接口，请检查目标页面或延长等待时间")
+            return
+        print("本次未发现新增接口，直接使用现有知识库生成文档和测试")
+        kb_results = merge_api_knowledge_base(
+            [],
+            args.kb_file,
+            skip_test_filters=args.skip_test_filter,
+        )
+        markdown = generate_markdown_doc(kb_results)
+        with open(API_DOC_PATH, "w", encoding="utf-8") as f:
+            f.write(markdown)
+        run_test_pipeline(kb_results, page_url, cookie_file=args.cookie_file)
+        return
 
     api_key, base_url, model = get_llm_config()
     if not api_key:
         print("未配置 LLM_API_KEY 或 OPENAI_API_KEY，无法调用大模型")
         return
 
-    if not llm_inputs:
-        print("未捕获到任何 XHR/Fetch 接口，请检查目标页面或延长等待时间")
-        return
-
     llm_client = LLMClient(api_key=api_key, base_url=base_url, model=model)
     analysis_results = []
 
-    for index, api_info in enumerate(llm_inputs, start=1):
+    for index, api_info in enumerate(new_llm_inputs, start=1):
         print(
-            f"正在分析第 {index}/{len(llm_inputs)} 个接口："
+            f"正在分析新增接口第 {index}/{len(new_llm_inputs)} 个："
             f"{api_info['method']} {api_info['path']}"
         )
         result = llm_client.analyze_api(api_info)
         analysis_results.append({
-            "raw": raw_records[index - 1],
+            "raw": new_raw_records[index - 1],
             "source": api_info,
             "analysis": result,
         })
 
-    with open(f"{DATA_DIR}/api_analysis.json", "w", encoding="utf-8") as f:
+    with open(DATA_DIR / "api_analysis.json", "w", encoding="utf-8") as f:
         json.dump(analysis_results, f, ensure_ascii=False, indent=2)
 
     kb_results = merge_api_knowledge_base(
@@ -169,24 +214,24 @@ def main():
         args.kb_file,
         skip_test_filters=args.skip_test_filter,
     )
-    with open(f"{DATA_DIR}/api_knowledge_base_snapshot.json", "w", encoding="utf-8") as f:
+    with open(DATA_DIR / "api_knowledge_base_snapshot.json", "w", encoding="utf-8") as f:
         json.dump(kb_results, f, ensure_ascii=False, indent=2)
     print(f"接口知识库已更新：{args.kb_file}")
 
     markdown = generate_markdown_doc(kb_results)
-    with open(f"{REPORT_DIR}/api_doc.md", "w", encoding="utf-8") as f:
+    with open(API_DOC_PATH, "w", encoding="utf-8") as f:
         f.write(markdown)
 
     run_test_pipeline(kb_results, page_url, cookie_file=args.cookie_file)
 
     print("处理完成")
-    print(f"原始抓包数据：{DATA_DIR}/api_records_raw.json")
-    print(f"清洗后数据：{DATA_DIR}/api_records_clean.json")
-    print(f"LLM 分析结果：{DATA_DIR}/api_analysis.json")
+    print(f"原始抓包数据：{DATA_DIR / 'api_records_raw.json'}")
+    print(f"清洗后数据：{DATA_DIR / 'api_records_clean.json'}")
+    print(f"LLM 分析结果：{DATA_DIR / 'api_analysis.json'}")
     print(f"接口知识库：{args.kb_file}")
-    print(f"接口文档：{REPORT_DIR}/api_doc.md")
-    print(f"测试脚本：{TESTS_DIR}/test_generated_api.py")
-    print(f"测试报告：{REPORT_DIR}/test_report.md")
+    print(f"接口文档：{API_DOC_PATH}")
+    print(f"测试脚本：{TESTS_DIR / 'test_generated_api.py'}")
+    print(f"测试报告：{TEST_REPORT_PATH}")
 
 
 if __name__ == "__main__":
